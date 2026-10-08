@@ -1,0 +1,17 @@
+# go build -o transom ./cmd/transom
+/transom
+
+# go test -c and coverage profiles
+*.test
+*.out
+
+# interrupted report writes (path.tmp beside -o)
+*.tmp
+
+# scan reports (-o). .htm and .html are both HTML; other names are JSON.
+*.htm
+*.html
+*.json
+
+# checks/paths.json is the starter corpus, not a report.
+!checks/*.json

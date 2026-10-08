@@ -1,0 +1,304 @@
+[
+  {
+    "id": "git-head",
+    "path": "/.git/HEAD",
+    "method": "GET",
+    "statuses": [200],
+    "body": "ref:",
+    "message": "Exposes git ref"
+  },
+  {
+    "id": "env-file",
+    "path": "/.env",
+    "method": "GET",
+    "statuses": [200],
+    "body": "(?m)^[A-Za-z_][A-Za-z0-9_]*=",
+    "message": "Assignment-style lines"
+  },
+  {
+    "id": "server-status",
+    "path": "/server-status",
+    "method": "GET",
+    "statuses": [200],
+    "body": "Apache Server Status",
+    "message": "Apache server status"
+  },
+  {
+    "id": "actuator",
+    "path": "/actuator",
+    "method": "GET",
+    "statuses": [200],
+    "body": "^\\s*\\{",
+    "message": "Returns a JSON object"
+  },
+  {
+    "id": "actuator-health",
+    "path": "/actuator/health",
+    "method": "GET",
+    "statuses": [200],
+    "body": "^\\s*\\{",
+    "message": "Returns a JSON object"
+  },
+  {
+    "id": "actuator-heapdump",
+    "path": "/actuator/heapdump",
+    "method": "GET",
+    "statuses": [200],
+    "headers": {"Content-Type": "octet-stream"},
+    "message": "Readable"
+  },
+  {
+    "id": "backup-zip",
+    "path": "/backup.zip",
+    "method": "GET",
+    "statuses": [200],
+    "body": "^PK\u0003\u0004",
+    "raw": true,
+    "message": "Zip archive"
+  },
+  {
+    "id": "backup-gzip",
+    "path": "/backup.tar.gz",
+    "method": "GET",
+    "statuses": [200],
+    "body": "^\\x1f\\x8b",
+    "raw": true,
+    "message": "gzip data"
+  },
+  {
+    "id": "db-sql",
+    "path": "/db.sql",
+    "method": "GET",
+    "statuses": [200],
+    "body": "(?i)create table|insert into|mysql dump",
+    "message": "Exposed database dump"
+  },
+  {
+    "id": "phpinfo",
+    "path": "/info.php",
+    "method": "GET",
+    "statuses": [200],
+    "body": "(?i)<title>phpinfo\\(\\)|PHP Version",
+    "message": "phpinfo() output"
+  },
+  {
+    "id": "apache-icons-readme",
+    "path": "/icons/README",
+    "method": "GET",
+    "statuses": [200],
+    "body": "(?i)public domain icons|apache server distributions",
+    "message": "Default Apache file"
+  },
+  {
+    "id": "composer-json",
+    "path": "/composer.json",
+    "method": "GET",
+    "statuses": [200],
+    "body": "\"require\"",
+    "message": "PHP package requirements"
+  },
+  {
+    "id": "composer-lock",
+    "path": "/composer.lock",
+    "method": "GET",
+    "statuses": [200],
+    "body": "\"content-hash\"",
+    "message": "Installed PHP packages"
+  },
+  {
+    "id": "composer-installed",
+    "path": "/vendor/composer/installed.json",
+    "method": "GET",
+    "statuses": [200],
+    "body": "\"version_normalized\"",
+    "message": "Installed PHP packages"
+  },
+  {
+    "id": "iis-default",
+    "path": "/",
+    "method": "GET",
+    "statuses": [200],
+    "body": "(?i)IIS\\s+Windows\\s+Server",
+    "message": "Default IIS page"
+  },
+  {
+    "id": "iisstart",
+    "path": "/iisstart.htm",
+    "method": "GET",
+    "statuses": [200],
+    "body": "(?i)IIS\\s+Windows\\s+Server",
+    "message": "Default IIS page"
+  },
+  {
+    "id": "test-txt",
+    "path": "/test.txt",
+    "method": "GET",
+    "statuses": [200],
+    "message": "Readable"
+  },
+  {
+    "id": "home-dir",
+    "path": "/home/",
+    "method": "GET",
+    "statuses": [200],
+    "ignoreSoft404": true,
+    "message": "Readable"
+  },
+  {
+    "id": "homepage-dir",
+    "path": "/homepage/",
+    "method": "GET",
+    "statuses": [200],
+    "ignoreSoft404": true,
+    "message": "Readable"
+  },
+  {
+    "id": "user-dir",
+    "path": "/user/",
+    "method": "GET",
+    "statuses": [200],
+    "ignoreSoft404": true,
+    "message": "Readable"
+  },
+  {
+    "id": "sitemap-xml",
+    "path": "/sitemap.xml",
+    "method": "GET",
+    "statuses": [200],
+    "body": "<urlset",
+    "message": "Sitemap"
+  },
+  {
+    "id": "ws-ftp-log",
+    "path": "/WS_FTP.LOG",
+    "method": "GET",
+    "statuses": [200],
+    "body": "(<--|-->)",
+    "message": "FTP transfer log"
+  },
+  {
+    "id": "phpinfo-php",
+    "path": "/phpinfo.php",
+    "method": "GET",
+    "statuses": [200],
+    "body": "(?i)<title>phpinfo\\(\\)|PHP Version",
+    "message": "phpinfo() output"
+  },
+  {
+    "id": "dir-php-error",
+    "path": "/dir/",
+    "method": "GET",
+    "statuses": [200],
+    "body": "(?i)parse error",
+    "message": "PHP error and a filesystem path"
+  },
+  {
+    "id": "test-index",
+    "path": "/test/",
+    "method": "GET",
+    "statuses": [200],
+    "body": "(?i)<title>Index of ",
+    "message": "Directory listing"
+  },
+  {
+    "id": "icons-index",
+    "path": "/icons/",
+    "method": "GET",
+    "statuses": [200],
+    "body": "(?i)<title>Index of ",
+    "message": "Directory listing"
+  },
+  {
+    "id": "svn-entries",
+    "path": "/.svn/entries",
+    "method": "GET",
+    "statuses": [200],
+    "body": "(?m)^dir$",
+    "message": "Subversion entries file"
+  },
+  {
+    "id": "python-samples",
+    "path": "/samples/",
+    "method": "GET",
+    "statuses": [200],
+    "body": "(?i)<title>Python samples</title>",
+    "message": "Python sample programs"
+  },
+  {
+    "id": "admin-login",
+    "path": "/admin/",
+    "method": "GET",
+    "statuses": [401],
+    "headers": {"WWW-Authenticate": "(?i)basic"},
+    "message": "Login page"
+  },
+  {
+    "id": "securecontrolpanel",
+    "path": "/securecontrolpanel/",
+    "method": "GET",
+    "statuses": [200],
+    "body": "(?i)<title>cPanel Redirect</title>",
+    "message": "Web server control panel"
+  },
+  {
+    "id": "webmail",
+    "path": "/webmail/",
+    "method": "GET",
+    "statuses": [200],
+    "body": "(?i)<title>cPanel Redirect</title>",
+    "message": "Web based mail package installed"
+  },
+  {
+    "id": "cpanel",
+    "path": "/cpanel/",
+    "method": "GET",
+    "statuses": [200],
+    "body": "(?i)<title>cPanel Redirect</title>",
+    "message": "Web-based control panel"
+  },
+  {
+    "id": "info-dir",
+    "path": "/info/",
+    "method": "GET",
+    "statuses": [200],
+    "body": "(?i)<pre>\\s*Array\\s*\\(",
+    "message": "This might be interesting"
+  },
+  {
+    "id": "public-dir",
+    "path": "/public/",
+    "method": "GET",
+    "statuses": [200],
+    "body": "(?i)<base href=[^ >]*/public/",
+    "message": "This might be interesting"
+  },
+  {
+    "id": "db-dir",
+    "path": "/db/",
+    "method": "GET",
+    "statuses": [200],
+    "message": "This might be interesting"
+  },
+  {
+    "id": "users-dir",
+    "path": "/users/",
+    "method": "GET",
+    "statuses": [200],
+    "message": "This might be interesting"
+  },
+  {
+    "id": "console",
+    "path": "/console",
+    "method": "GET",
+    "statuses": [200],
+    "message": "This might be interesting"
+  },
+  {
+    "id": "web-config",
+    "path": "/web.config",
+    "method": "GET",
+    "statuses": [200],
+    "body": "(?i)<configuration>",
+    "message": "ASP config file is accessible"
+  }
+]
