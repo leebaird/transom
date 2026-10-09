@@ -7,6 +7,7 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"unicode"
 )
 
 // Target is one scheme, host, and port. Discover is set for a bare hostname,
@@ -46,6 +47,9 @@ func parseURL(raw string) (Target, error) {
 	if host == "" {
 		return Target{}, fmt.Errorf("URL has no host")
 	}
+	if strings.ContainsFunc(host, unsafeHostRune) {
+		return Target{}, fmt.Errorf("invalid host %q", host)
+	}
 	port := 80
 	if scheme == "https" {
 		port = 443
@@ -70,7 +74,7 @@ func parseURL(raw string) (Target, error) {
 }
 
 func parseHost(raw string) (Target, error) {
-	host := raw
+	var host string
 	port := 0
 	discover := true
 
@@ -99,10 +103,19 @@ func parseHost(raw string) (Target, error) {
 	if host == "" {
 		return Target{}, fmt.Errorf("empty host")
 	}
+	if strings.ContainsFunc(host, unsafeHostRune) {
+		return Target{}, fmt.Errorf("invalid host %q", host)
+	}
 	if ip := net.ParseIP(host); ip == nil && strings.Contains(host, ":") {
 		return Target{}, fmt.Errorf("use [ipv6]:port for %q", raw)
 	}
 	return Target{Host: host, Port: port, Root: "/", Discover: discover}, nil
+}
+
+// unsafeHostRune reports a character no hostname has and that would break a
+// request line or a Host header: whitespace and control characters.
+func unsafeHostRune(r rune) bool {
+	return unicode.IsSpace(r) || unicode.IsControl(r)
 }
 
 func splitBracket(raw string) (host string, port int, hasPort bool, err error) {
@@ -129,23 +142,21 @@ func splitBracket(raw string) (host string, port int, hasPort bool, err error) {
 }
 
 func splitHostPort(raw string) (host string, port int, hasPort bool, err error) {
-	colon := strings.LastIndexByte(raw, ':')
-	if colon < 0 {
+	before, suffix, found := strings.CutLast(raw, ":")
+	if !found {
 		return raw, 0, false, nil
 	}
 	if strings.Count(raw, ":") > 1 {
 		return "", 0, false, fmt.Errorf("use [ipv6]:port for %q", raw)
 	}
-	suffix := raw[colon+1:]
 	n, conv := strconv.Atoi(suffix)
 	if conv != nil || n < 1 || n > 65535 {
 		return "", 0, false, fmt.Errorf("invalid port %q", suffix)
 	}
-	host = raw[:colon]
-	if host == "" {
+	if before == "" {
 		return "", 0, false, fmt.Errorf("empty host")
 	}
-	return host, n, true, nil
+	return before, n, true, nil
 }
 
 func cleanRoot(path string) string {

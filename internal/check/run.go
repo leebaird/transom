@@ -3,14 +3,101 @@ package check
 import (
 	"context"
 	"net/http"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/leebaird/transom/internal/fetch"
+	"github.com/leebaird/transom/internal/parallel"
 	"github.com/leebaird/transom/internal/target"
 )
+
+// scan is what every built-in check is given: the origin, its client, and
+// the base response the others are compared against.
+type scan struct {
+	t       target.Target
+	client  *fetch.Client
+	base    fetch.Response
+	banners *bannerWatch
+
+	robotsOnce sync.Once
+	robotsResp fetch.Response
+}
+
+// robots is the /robots.txt response, fetched once for every check that
+// reads it.
+func (s *scan) robots(ctx context.Context) fetch.Response {
+	s.robotsOnce.Do(func() {
+		s.robotsResp = s.client.Do(ctx, http.MethodGet, s.t.Join("/robots.txt"))
+	})
+	return s.robotsResp
+}
+
+// builtins are the checks compiled into the program. They run at the same
+// time, before the path checks, so none may depend on another having
+// finished. Their findings are collected in this order.
+var builtins = []func(ctx context.Context, s *scan) []Finding{
+	func(_ context.Context, s *scan) []Finding {
+		return headerFindings(s.t, s.base)
+	},
+	func(ctx context.Context, s *scan) []Finding {
+		return ipLinkFindings(ctx, s.t, s.base, s.client.Timeout())
+	},
+	func(ctx context.Context, s *scan) []Finding {
+		return optionsFindings(ctx, s.client, s.t)
+	},
+	func(ctx context.Context, s *scan) []Finding {
+		return junkMethodFindings(ctx, s.client, s.t, s.base)
+	},
+	func(ctx context.Context, s *scan) []Finding {
+		return traceFindings(ctx, s.client, s.t)
+	},
+	func(ctx context.Context, s *scan) []Finding {
+		return etagFindings(s.t, s.base, s.robots(ctx))
+	},
+	func(ctx context.Context, s *scan) []Finding {
+		return negotiationFindings(ctx, s.client, s.t)
+	},
+	func(ctx context.Context, s *scan) []Finding {
+		return phpCreditFindings(ctx, s.client, s.t)
+	},
+	func(ctx context.Context, s *scan) []Finding {
+		return acaoFindings(ctx, s.client, s.t, s.base)
+	},
+	func(ctx context.Context, s *scan) []Finding {
+		return cloudflareTraceFindings(ctx, s.client, s.t, s.base)
+	},
+	func(_ context.Context, s *scan) []Finding {
+		return cookieFindings(s.t, s.base)
+	},
+	// TRACK with no Host header.
+	func(ctx context.Context, s *scan) []Finding {
+		resp, ok := hostlessMethod(ctx, s.t, "TRACK", s.client.Timeout())
+		if !ok {
+			return nil
+		}
+		s.banners.observe(resp)
+		// Only cookies the base response did not already set.
+		return unseenCookies(cookieFindings(s.t, s.base), cookieFindings(s.t, resp))
+	},
+	func(ctx context.Context, s *scan) []Finding {
+		return aspnetFindings(ctx, s.client, s.t, s.base)
+	},
+	func(ctx context.Context, s *scan) []Finding {
+		return internalIPFindings(ctx, s.t, s.client.Timeout())
+	},
+	func(ctx context.Context, s *scan) []Finding {
+		return defaultIISFindings(ctx, s.t, s.client.Timeout())
+	},
+	func(_ context.Context, s *scan) []Finding {
+		if s.t.Scheme != "https" {
+			return nil
+		}
+		return certFindings(s.t.Host, s.base.TLS, time.Now(), s.t.BaseURL(), s.base.URL, s.base.Status)
+	},
+}
 
 // Run checks one origin. A transport error on the base URL is returned and no
 // path checks are issued. A canceled context returns whatever was collected.
@@ -18,33 +105,19 @@ func Run(ctx context.Context, t target.Target, client *fetch.Client, checks []Ch
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	banners := &bannerWatch{base: t.BaseURL()}
-	client.Observe = banners.observe
+	client.Observe = nil
 	base := client.Do(ctx, http.MethodGet, t.Join("/"))
 	if base.Err != nil {
 		return nil, base.Err
 	}
-	findings := headerFindings(t, base)
-	findings = append(findings, ipLinkFindings(ctx, t, base, client.Timeout())...)
-	findings = append(findings, optionsFindings(ctx, client, t)...)
-	findings = append(findings, junkMethodFindings(ctx, client, t, base)...)
-	findings = append(findings, traceFindings(ctx, client, t)...)
-	findings = append(findings, etagFindings(ctx, client, t, base)...)
-	findings = append(findings, negotiationFindings(ctx, client, t)...)
-	findings = append(findings, phpCreditFindings(ctx, client, t)...)
-	findings = append(findings, acaoFindings(ctx, client, t, base)...)
-	findings = append(findings, cloudflareTraceFindings(ctx, client, t, base)...)
-	findings = append(findings, cookieFindings(t, base)...)
-	if resp, ok := hostlessMethod(ctx, t, "TRACK", client.Timeout()); ok {
-		banners.observe(resp)
-		findings = append(findings, unseenCookies(findings, cookieFindings(t, resp))...)
-	}
-	findings = append(findings, aspnetFindings(ctx, client, t, base)...)
-	findings = append(findings, internalIPFindings(ctx, t, client.Timeout())...)
-	findings = append(findings, defaultIISFindings(ctx, t, client.Timeout())...)
-	if t.Scheme == "https" {
-		findings = append(findings, certFindings(t.Host, base.TLS, time.Now(), t.BaseURL(), base.URL, base.Status)...)
-	}
+	banners := newBannerWatch(t.BaseURL(), base)
+	client.Observe = banners.observe
+	s := &scan{t: t, client: client, base: base, banners: banners}
+	found := make([][]Finding, len(builtins))
+	parallel.Each(len(builtins), concurrency, func(i int) {
+		found[i] = builtins[i](ctx, s)
+	})
+	findings := slices.Concat(found...)
 
 	softResp := client.Do(ctx, http.MethodGet, t.Join(softPath()))
 	soft := ""
@@ -56,7 +129,7 @@ func Run(ctx context.Context, t target.Target, client *fetch.Client, checks []Ch
 	pathFindings := runPaths(ctx, t, client, checks, concurrency, soft, softOK)
 	findings = append(findings, pathFindings...)
 	if ctx.Err() == nil {
-		findings = append(findings, robotsFindings(ctx, client, t, soft, softOK)...)
+		findings = append(findings, robotsFindings(ctx, client, t, s.robots(ctx), concurrency, soft, softOK)...)
 	}
 	findings = append(findings, banners.finding()...)
 	sort.Slice(findings, func(i, j int) bool {
@@ -193,62 +266,41 @@ func findingLess(a, b Finding) bool {
 }
 
 func runPaths(ctx context.Context, t target.Target, client *fetch.Client, checks []Check, concurrency int, soft string, softOK bool) []Finding {
-	if len(checks) == 0 {
-		return nil
-	}
-	if concurrency < 1 {
-		concurrency = 1
-	}
-	if concurrency > len(checks) {
-		concurrency = len(checks)
-	}
-	jobs := make(chan Check)
-	var wg sync.WaitGroup
-	var mu sync.Mutex
-	var out []Finding
-	for i := 0; i < concurrency; i++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			for c := range jobs {
-				if ctx.Err() != nil {
-					continue
-				}
-				path := t.Join(c.Path)
-				var resp fetch.Response
-				if c.Raw {
-					resp = client.DoIdentity(ctx, c.Method, path)
-				} else {
-					resp = client.Do(ctx, c.Method, path)
-				}
-				if !c.match(resp.Status, resp.Body, resp.Header, resp.Err != nil, soft, softOK) {
-					continue
-				}
-				// A redirect onto the base URL is the site itself. A check that
-				// asked for that URL, such as the default page at /, is kept.
-				asked := t.URL(path)
-				if !sameBaseURL(asked, t.BaseURL()) && sameBaseURL(resp.URL, t.BaseURL()) {
-					continue
-				}
-				msg := c.Message
-				if c.ID == "user-dir" && loginPage(resp.Body) {
-					msg = "Login page"
-				}
-				mu.Lock()
-				out = append(out, Finding{
-					ID: c.ID, Target: t.BaseURL(), URL: resp.URL, Status: resp.Status, Message: msg,
-				})
-				mu.Unlock()
-			}
-		}()
-	}
-	for _, c := range checks {
-		select {
-		case <-ctx.Done():
-		case jobs <- c:
+	// A check that does not match leaves its slot empty.
+	found := make([]Finding, len(checks))
+	parallel.Each(len(checks), concurrency, func(i int) {
+		if ctx.Err() != nil {
+			return
 		}
-	}
-	close(jobs)
-	wg.Wait()
-	return out
+		c := checks[i]
+		path := t.Join(c.Path)
+		var resp fetch.Response
+		if c.Raw {
+			resp = client.DoIdentity(ctx, c.Method, path)
+		} else {
+			resp = client.Do(ctx, c.Method, path)
+		}
+		if !c.match(resp.Status, resp.Body, resp.Header, resp.Err != nil, soft, softOK) {
+			return
+		}
+		// A redirect onto the base URL is the site itself. A check that
+		// asked for that URL, such as the default page at /, is kept.
+		asked := t.URL(path)
+		if !sameBaseURL(asked, t.BaseURL()) && sameBaseURL(resp.URL, t.BaseURL()) {
+			return
+		}
+		msg := c.Message
+		if c.ID == "user-dir" && loginPage(resp.Body) {
+			msg = "Login page"
+		}
+		found[i] = Finding{
+			ID: c.ID, Target: t.BaseURL(), URL: resp.URL, Status: resp.Status, Message: msg,
+		}
+	})
+	return withoutEmpty(found)
+}
+
+// withoutEmpty drops the slots a concurrent pass left unfilled.
+func withoutEmpty(found []Finding) []Finding {
+	return slices.DeleteFunc(found, func(f Finding) bool { return f.ID == "" })
 }

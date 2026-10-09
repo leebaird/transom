@@ -1,0 +1,52 @@
+name: govulncheck
+
+on:
+  push:
+    branches: [ "master" ]
+  pull_request:
+    branches: [ "*" ]
+  schedule:
+    # Advisories are published without a commit here, so check weekly too.
+    - cron: '23 6 * * 1'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: govulncheck-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+
+  govulncheck:
+    name: govulncheck
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+    - name: Harden the runner (Block unexpected outbound calls)
+      uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1 # v2.21.1
+      with:
+        egress-policy: block
+        allowed-endpoints: >
+          api.github.com:443
+          github.com:443
+          raw.githubusercontent.com:443
+          release-assets.githubusercontent.com:443
+          proxy.golang.org:443
+          sum.golang.org:443
+          vuln.go.dev:443
+
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      with:
+        persist-credentials: false
+
+    - name: Set up Go
+      uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+      with:
+        go-version-file: go.mod
+        check-latest: true
+        cache: false
+
+    # The govulncheck version is pinned in the Makefile.
+    - name: Run govulncheck
+      run: make vulncheck

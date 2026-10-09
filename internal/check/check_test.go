@@ -10,10 +10,14 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
+	"testing/fstest"
 	"time"
 
 	"github.com/leebaird/transom/internal/fetch"
@@ -85,6 +89,114 @@ func TestLoadRejectsBadRegex(t *testing.T) {
 	}
 }
 
+// busyServer answers enough of the built-in checks to give a scan several
+// kinds of finding, and records how many requests were in flight at once.
+func busyServer(t *testing.T, peak *atomic.Int64) *httptest.Server {
+	t.Helper()
+	var inFlight atomic.Int64
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		now := inFlight.Add(1)
+		defer inFlight.Add(-1)
+		for {
+			seen := peak.Load()
+			if now <= seen || peak.CompareAndSwap(seen, now) {
+				break
+			}
+		}
+		time.Sleep(5 * time.Millisecond)
+		w.Header().Set("Server", "nginx/1.18.0")
+		w.Header().Set("X-Powered-By", "PHP/7.4.3")
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+		http.SetCookie(w, &http.Cookie{Name: "session", Value: "1"})
+		switch {
+		case r.Method == http.MethodOptions:
+			w.Header().Set("Allow", "GET, HEAD, OPTIONS")
+		case r.URL.Path == "/":
+			_, _ = io.WriteString(w, "home")
+		case r.URL.Path == "/robots.txt":
+			_, _ = io.WriteString(w, "Disallow: /a\nDisallow: /b\nDisallow: /c\nDisallow: /d\nDisallow: /missing\n")
+		case len(r.URL.Path) == 2:
+			_, _ = io.WriteString(w, "page "+r.URL.Path)
+		case r.URL.Path == "/.env":
+			_, _ = io.WriteString(w, "DB_PASSWORD=x\n")
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	t.Cleanup(srv.Close)
+	return srv
+}
+
+func TestRunSameFindingsAtAnyConcurrency(t *testing.T) {
+	checks, err := LoadDir("../../checks")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var peak atomic.Int64
+	srv := busyServer(t, &peak)
+	tg := mustTarget(t, srv.URL)
+	scan := func(concurrency int) []Finding {
+		t.Helper()
+		findings, err := Run(t.Context(), tg, mustClient(t, tg), checks, concurrency)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return findings
+	}
+	serial := scan(1)
+	if len(serial) < 10 {
+		t.Fatalf("only %d findings: %+v", len(serial), serial)
+	}
+	for _, concurrency := range []int{2, 8, 32} {
+		if got := scan(concurrency); !slices.Equal(got, serial) {
+			t.Fatalf("concurrency %d:\n%+v\nserial:\n%+v", concurrency, got, serial)
+		}
+	}
+}
+
+func TestRunStaysWithinConcurrency(t *testing.T) {
+	checks, err := LoadDir("../../checks")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, limit := range []int{1, 4} {
+		var peak atomic.Int64
+		srv := busyServer(t, &peak)
+		tg := mustTarget(t, srv.URL)
+		if _, err := Run(t.Context(), tg, mustClient(t, tg), checks, limit); err != nil {
+			t.Fatal(err)
+		}
+		if got := peak.Load(); got > int64(limit) {
+			t.Fatalf("limit %d: %d requests in flight", limit, got)
+		}
+		if got := peak.Load(); limit > 1 && got < 2 {
+			t.Fatalf("limit %d: requests never overlapped", limit)
+		}
+	}
+}
+
+func TestLoadFS(t *testing.T) {
+	fsys := fstest.MapFS{
+		"checks/b.json":   {Data: []byte(`[{"id":"b","path":"/b","message":"m"}]`)},
+		"checks/a.json":   {Data: []byte(`[{"id":"a","path":"/a","message":"m"}]`)},
+		"checks/skip.txt": {Data: []byte("not a corpus")},
+	}
+	checks, err := LoadFS(fsys, "checks")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(checks) != 2 || checks[0].ID != "a" || checks[1].ID != "b" {
+		t.Fatalf("%+v", checks)
+	}
+	fsys["checks/c.json"] = &fstest.MapFile{Data: []byte(`[{"id":"a","path":"/c","message":"m"}]`)}
+	if _, err := LoadFS(fsys, "checks"); err == nil || !strings.Contains(err.Error(), "duplicate check id") {
+		t.Fatalf("err %v", err)
+	}
+	if _, err := LoadFS(fsys, "missing"); err == nil {
+		t.Fatal("expected error")
+	}
+}
+
 func TestSoft404SuppressesMatchingBody(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("X-Content-Type-Options", "nosniff")
@@ -104,7 +216,7 @@ func TestSoft404SuppressesMatchingBody(t *testing.T) {
 	}
 	tg := mustTarget(t, srv.URL)
 	client := mustClient(t, tg)
-	findings, err := Run(context.Background(), tg, client, checks, 2)
+	findings, err := Run(t.Context(), tg, client, checks, 2)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -116,12 +228,15 @@ func TestSoft404SuppressesMatchingBody(t *testing.T) {
 }
 
 func TestPathCheckAndRootJoin(t *testing.T) {
+	var mu sync.Mutex
 	var paths []string
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("X-Content-Type-Options", "nosniff")
 		w.Header().Set("Content-Security-Policy", "default-src 'none'")
 		w.Header().Set("Referrer-Policy", "no-referrer")
+		mu.Lock()
 		paths = append(paths, r.URL.Path)
+		mu.Unlock()
 		if strings.Contains(r.URL.Path, "transom-") {
 			w.WriteHeader(http.StatusNotFound)
 			return
@@ -141,7 +256,7 @@ func TestPathCheckAndRootJoin(t *testing.T) {
 	tg := mustTarget(t, srv.URL)
 	tg.Root = "/app"
 	client := mustClient(t, tg)
-	findings, err := Run(context.Background(), tg, client, checks, 2)
+	findings, err := Run(t.Context(), tg, client, checks, 2)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -160,7 +275,7 @@ func TestMissingSecurityHeaders(t *testing.T) {
 	defer srv.Close()
 	tg := mustTarget(t, srv.URL)
 	client := mustClient(t, tg)
-	findings, err := Run(context.Background(), tg, client, nil, 1)
+	findings, err := Run(t.Context(), tg, client, nil, 1)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -252,7 +367,7 @@ func TestInodeETag(t *testing.T) {
 	defer srv.Close()
 	tg := mustTarget(t, srv.URL)
 	client := mustClient(t, tg)
-	findings, err := Run(context.Background(), tg, client, nil, 1)
+	findings, err := Run(t.Context(), tg, client, nil, 1)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -350,7 +465,7 @@ func TestCloudflareTrace(t *testing.T) {
 	defer srv.Close()
 	tg := mustTarget(t, srv.URL)
 	client := mustClient(t, tg)
-	findings, err := Run(context.Background(), tg, client, nil, 1)
+	findings, err := Run(t.Context(), tg, client, nil, 1)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -377,8 +492,7 @@ func TestCloudflareTrace(t *testing.T) {
 }
 
 func TestBannerWatch(t *testing.T) {
-	w := &bannerWatch{base: "http://example.com/"}
-	w.observe(fetch.Response{Status: 200, URL: "http://example.com/", Header: http.Header{"Server": {"Heroku"}}})
+	w := newBannerWatch("http://example.com/", fetch.Response{Status: 200, URL: "http://example.com/", Header: http.Header{"Server": {"Heroku"}}})
 	w.observe(fetch.Response{Status: 404, URL: "http://example.com/missing", Header: http.Header{"Server": {"Microsoft-HTTPAPI/2.0"}}})
 	if got := w.finding(); got != nil {
 		t.Fatalf("httpapi counted as a change: %+v", got)
@@ -388,6 +502,85 @@ func TestBannerWatch(t *testing.T) {
 	got := w.finding()
 	if len(got) != 1 || got[0].Message != "Server banner changed from 'Heroku' to 'Apache/2.4.68 (Unix)'" || got[0].URL != "http://example.com/.git/HEAD" {
 		t.Fatalf("%+v", got)
+	}
+}
+
+func TestBannerWatchIgnoresArrivalOrder(t *testing.T) {
+	server := func(url, banner string) fetch.Response {
+		return fetch.Response{Status: 200, URL: url, Header: http.Header{"Server": {banner}}}
+	}
+	seen := []fetch.Response{
+		server("http://example.com/b", "nginx"),
+		server("http://example.com/a", "Apache"),
+		server("http://example.com/c", "Microsoft-HTTPAPI/2.0"),
+		server("http://example.com/z", "Apache"),
+	}
+	for _, tc := range []struct {
+		name, base, want string
+	}{
+		{"base banner", "Heroku", "Server banner changed from 'Heroku' to 'Apache'"},
+		// With no banner on the base response, the lowest URL stands in for it.
+		{"no base banner", "", "Server banner changed from 'Apache' to 'nginx'"},
+	} {
+		var first []Finding
+		for range 2 {
+			w := newBannerWatch("http://example.com/", server("http://example.com/", tc.base))
+			for _, resp := range seen {
+				w.observe(resp)
+			}
+			got := w.finding()
+			if len(got) != 1 || got[0].Message != tc.want {
+				t.Fatalf("%s: %+v", tc.name, got)
+			}
+			if first != nil && !slices.Equal(got, first) {
+				t.Fatalf("%s: %+v then %+v", tc.name, first, got)
+			}
+			first = got
+			slices.Reverse(seen)
+		}
+	}
+	// The HTTP.sys banner is never a change, in either direction.
+	w := newBannerWatch("http://example.com/", fetch.Response{URL: "http://example.com/", Header: http.Header{}})
+	w.observe(server("http://example.com/a", "Microsoft-HTTPAPI/2.0"))
+	w.observe(server("http://example.com/b", "Microsoft-IIS/10.0"))
+	if got := w.finding(); got != nil {
+		t.Fatalf("%+v", got)
+	}
+}
+
+func TestRawProbeStopsOnCancel(t *testing.T) {
+	ln, err := (&net.ListenConfig{}).Listen(t.Context(), "tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+	// Accepts the request and never answers it.
+	go func() {
+		for {
+			conn, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			defer conn.Close()
+		}
+	}()
+	host, portText, err := net.SplitHostPort(ln.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	port, err := strconv.Atoi(portText)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tg := target.Target{Host: host, Port: port, Scheme: "http", Root: "/"}
+	ctx, cancel := context.WithCancel(t.Context())
+	time.AfterFunc(100*time.Millisecond, cancel)
+	start := time.Now()
+	if _, _, _, err := http10NoHost(ctx, tg, "/", 30*time.Second); err == nil {
+		t.Fatal("silent server answered")
+	}
+	if took := time.Since(start); took > 5*time.Second {
+		t.Fatalf("probe took %s after cancel", took)
 	}
 }
 
@@ -407,7 +600,7 @@ func TestBannerChangeDuringScan(t *testing.T) {
 	checks := []Check{{
 		ID: "git-head", Path: "/.git/HEAD", Method: http.MethodGet, Statuses: []int{http.StatusOK}, Message: "Exposes git ref",
 	}}
-	findings, err := Run(context.Background(), tg, client, checks, 2)
+	findings, err := Run(t.Context(), tg, client, checks, 2)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -444,7 +637,7 @@ func TestHostlessTrackOrigin(t *testing.T) {
 	defer srv.Close()
 	tg := mustTarget(t, srv.URL)
 	client := mustClient(t, tg)
-	findings, err := Run(context.Background(), tg, client, nil, 1)
+	findings, err := Run(t.Context(), tg, client, nil, 1)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -477,7 +670,7 @@ func TestCertHostnameAndExpiry(t *testing.T) {
 	defer srv.Close()
 	tg := mustTarget(t, srv.URL)
 	client := mustClient(t, tg)
-	resp := client.Do(context.Background(), http.MethodGet, "/")
+	resp := client.Do(t.Context(), http.MethodGet, "/")
 	if resp.Err != nil {
 		t.Fatal(resp.Err)
 	}
@@ -531,7 +724,7 @@ func TestOptionsAllow(t *testing.T) {
 	defer srv.Close()
 	tg := mustTarget(t, srv.URL)
 	client := mustClient(t, tg)
-	findings, err := Run(context.Background(), tg, client, nil, 1)
+	findings, err := Run(t.Context(), tg, client, nil, 1)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -688,7 +881,7 @@ func TestCookieNameOrder(t *testing.T) {
 }
 
 func TestInternalIP(t *testing.T) {
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	ln, err := (&net.ListenConfig{}).Listen(t.Context(), "tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -712,14 +905,14 @@ func TestInternalIP(t *testing.T) {
 		t.Fatal(err)
 	}
 	tg := target.Target{Host: host, Port: port, Scheme: "http", Root: "/"}
-	findings := internalIPFindings(context.Background(), tg, 2*time.Second)
+	findings := internalIPFindings(t.Context(), tg, 2*time.Second)
 	if len(findings) != 1 || findings[0].Status != 301 || findings[0].Message != "Location discloses internal address 10.0.0.14" {
 		t.Fatalf("%+v", findings)
 	}
 }
 
 func TestInternalIPIgnoresBody(t *testing.T) {
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	ln, err := (&net.ListenConfig{}).Listen(t.Context(), "tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -742,14 +935,14 @@ func TestInternalIPIgnoresBody(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	findings := internalIPFindings(context.Background(), target.Target{Host: host, Port: port, Scheme: "http", Root: "/"}, 2*time.Second)
+	findings := internalIPFindings(t.Context(), target.Target{Host: host, Port: port, Scheme: "http", Root: "/"}, 2*time.Second)
 	if len(findings) != 0 {
 		t.Fatalf("%+v", findings)
 	}
 }
 
 func TestDefaultIISPage(t *testing.T) {
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	ln, err := (&net.ListenConfig{}).Listen(t.Context(), "tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -772,14 +965,14 @@ func TestDefaultIISPage(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	findings := defaultIISFindings(context.Background(), target.Target{Host: host, Port: port, Scheme: "http", Root: "/"}, 2*time.Second)
+	findings := defaultIISFindings(t.Context(), target.Target{Host: host, Port: port, Scheme: "http", Root: "/"}, 2*time.Second)
 	if len(findings) != 1 || findings[0].ID != "iis-default" || findings[0].Status != 200 {
 		t.Fatalf("%+v", findings)
 	}
 }
 
 func TestDefaultIISRequires200(t *testing.T) {
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	ln, err := (&net.ListenConfig{}).Listen(t.Context(), "tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -802,7 +995,7 @@ func TestDefaultIISRequires200(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	findings := defaultIISFindings(context.Background(), target.Target{Host: host, Port: port, Scheme: "http", Root: "/"}, 2*time.Second)
+	findings := defaultIISFindings(t.Context(), target.Target{Host: host, Port: port, Scheme: "http", Root: "/"}, 2*time.Second)
 	if len(findings) != 0 {
 		t.Fatalf("%+v", findings)
 	}
@@ -825,7 +1018,7 @@ func TestRobotsReadablePath(t *testing.T) {
 	defer srv.Close()
 	tg := mustTarget(t, srv.URL)
 	client := mustClient(t, tg)
-	findings, err := Run(context.Background(), tg, client, nil, 1)
+	findings, err := Run(t.Context(), tg, client, nil, 1)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -870,7 +1063,7 @@ func TestHomeDirRedirectToBaseNotReported(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	findings, err := Run(context.Background(), tg, client, []Check{home}, 1)
+	findings, err := Run(t.Context(), tg, client, []Check{home}, 1)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -895,7 +1088,7 @@ func TestUserDirLoginPage(t *testing.T) {
 	defer srv.Close()
 	tg := mustTarget(t, srv.URL)
 	client := mustClient(t, tg)
-	findings, err := Run(context.Background(), tg, client, []Check{login}, 1)
+	findings, err := Run(t.Context(), tg, client, []Check{login}, 1)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -919,7 +1112,7 @@ func TestUserDirLoginPage(t *testing.T) {
 	defer dir.Close()
 	tg = mustTarget(t, dir.URL)
 	client = mustClient(t, tg)
-	findings, err = Run(context.Background(), tg, client, []Check{login}, 1)
+	findings, err = Run(t.Context(), tg, client, []Check{login}, 1)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -935,12 +1128,7 @@ func TestUserDirLoginPage(t *testing.T) {
 }
 
 func containsPath(paths []string, want string) bool {
-	for _, p := range paths {
-		if p == want {
-			return true
-		}
-	}
-	return false
+	return slices.Contains(paths, want)
 }
 
 func hasID(findings []Finding, id string) bool {
@@ -984,7 +1172,7 @@ func TestDebugMethodDistinctFromJunk(t *testing.T) {
 	defer srv.Close()
 	tg := mustTarget(t, srv.URL)
 	client := mustClient(t, tg)
-	findings, err := Run(context.Background(), tg, client, nil, 1)
+	findings, err := Run(t.Context(), tg, client, nil, 1)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1004,7 +1192,7 @@ func TestDebugMethodSameBodySkipped(t *testing.T) {
 	defer srv.Close()
 	tg := mustTarget(t, srv.URL)
 	client := mustClient(t, tg)
-	findings, err := Run(context.Background(), tg, client, nil, 1)
+	findings, err := Run(t.Context(), tg, client, nil, 1)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1020,7 +1208,7 @@ func TestJunkSameAsGetSkipped(t *testing.T) {
 	defer srv.Close()
 	tg := mustTarget(t, srv.URL)
 	client := mustClient(t, tg)
-	findings, err := Run(context.Background(), tg, client, nil, 1)
+	findings, err := Run(t.Context(), tg, client, nil, 1)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1047,7 +1235,7 @@ func TestRootPathCheckKept(t *testing.T) {
 	defer srv.Close()
 	tg := mustTarget(t, srv.URL)
 	client := mustClient(t, tg)
-	findings, err := Run(context.Background(), tg, client, []Check{c}, 1)
+	findings, err := Run(t.Context(), tg, client, []Check{c}, 1)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1070,7 +1258,7 @@ func TestPHPCreditsUnderRoot(t *testing.T) {
 	tg := mustTarget(t, srv.URL)
 	tg.Root = "/app"
 	client := mustClient(t, tg)
-	findings := phpCreditFindings(context.Background(), client, tg)
+	findings := phpCreditFindings(t.Context(), client, tg)
 	if len(findings) != 1 || findings[0].ID != "php-credits" {
 		t.Fatalf("%+v got %s", findings, got)
 	}
@@ -1080,7 +1268,7 @@ func TestPHPCreditsUnderRoot(t *testing.T) {
 }
 
 func TestRawProbeEncodesPath(t *testing.T) {
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	ln, err := (&net.ListenConfig{}).Listen(t.Context(), "tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1106,7 +1294,7 @@ func TestRawProbeEncodesPath(t *testing.T) {
 		t.Fatal(err)
 	}
 	tg := target.Target{Host: host, Port: port, Scheme: "http", Root: "/"}
-	if _, _, _, err := http10NoHost(context.Background(), tg, "/my file", 2*time.Second); err != nil {
+	if _, _, _, err := http10NoHost(t.Context(), tg, "/my file", 2*time.Second); err != nil {
 		t.Fatal(err)
 	}
 	line := <-gotLine
@@ -1138,7 +1326,7 @@ func TestIdentityMagicFetch(t *testing.T) {
 	defer srv.Close()
 	tg := mustTarget(t, srv.URL)
 	client := mustClient(t, tg)
-	findings, err := Run(context.Background(), tg, client, []Check{c}, 1)
+	findings, err := Run(t.Context(), tg, client, []Check{c}, 1)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1148,7 +1336,7 @@ func TestIdentityMagicFetch(t *testing.T) {
 }
 
 func TestShortBodyStillScans(t *testing.T) {
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	ln, err := (&net.ListenConfig{}).Listen(t.Context(), "tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1175,7 +1363,7 @@ func TestShortBodyStillScans(t *testing.T) {
 	raw := "http://" + net.JoinHostPort(host, strconv.Itoa(port)) + "/"
 	tg := mustTarget(t, raw)
 	client := mustClient(t, tg)
-	findings, err := Run(context.Background(), tg, client, nil, 1)
+	findings, err := Run(t.Context(), tg, client, nil, 1)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1228,7 +1416,7 @@ func TestIPLinkWhenHostnameOmitsIt(t *testing.T) {
 	tg := mustTarget(t, srv.URL)
 	tg.Host = "localhost"
 	base := fetch.Response{Status: 200, URL: tg.BaseURL(), Header: make(http.Header)}
-	found := ipLinkFindings(context.Background(), tg, base, 2*time.Second)
+	found := ipLinkFindings(t.Context(), tg, base, 2*time.Second)
 	if len(found) != 1 || found[0].ID != "header-link" || !strings.Contains(found[0].Message, `rel="canonical"`) {
 		t.Fatalf("%+v", found)
 	}
@@ -1236,7 +1424,7 @@ func TestIPLinkWhenHostnameOmitsIt(t *testing.T) {
 		t.Fatalf("url %s", found[0].URL)
 	}
 	base.Header.Set("Link", `</>; rel="canonical"`)
-	if extra := ipLinkFindings(context.Background(), tg, base, 2*time.Second); extra != nil {
+	if extra := ipLinkFindings(t.Context(), tg, base, 2*time.Second); extra != nil {
 		t.Fatalf("duplicate link: %+v", extra)
 	}
 }

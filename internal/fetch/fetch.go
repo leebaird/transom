@@ -50,6 +50,11 @@ func (c *Client) do(ctx context.Context, method, path string, identity bool) (ou
 	if err != nil {
 		return Response{Err: err, Duration: time.Since(start)}
 	}
+	// Every request is a bodiless probe that is safe to send twice. This
+	// entry tells net/http so: it then retries any method, not only GET, on a
+	// pooled connection the server has already closed. An entry with no value
+	// is not written to the wire.
+	req.Header["Idempotency-Key"] = []string{}
 	if c.ua != "" {
 		req.Header.Set("User-Agent", c.ua)
 	}

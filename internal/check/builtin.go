@@ -9,15 +9,19 @@ import (
 	"encoding/hex"
 	"fmt"
 	"io"
+	"maps"
+	"math"
 	"net"
 	"net/http"
 	"regexp"
+	"slices"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/leebaird/transom/internal/discover"
 	"github.com/leebaird/transom/internal/fetch"
+	"github.com/leebaird/transom/internal/parallel"
 	"github.com/leebaird/transom/internal/target"
 )
 
@@ -197,7 +201,7 @@ func bannerFindings(base string, resp fetch.Response) []Finding {
 }
 
 func versionLess(got, floor [3]int) bool {
-	for i := 0; i < 3; i++ {
+	for i := range 3 {
 		if got[i] != floor[i] {
 			return got[i] < floor[i]
 		}
@@ -205,9 +209,15 @@ func versionLess(got, floor [3]int) bool {
 	return false
 }
 
+// atoi reads a run of ASCII digits. A number too large for an int stops at
+// the largest one, so an absurd version in a banner still compares as newer
+// than any release instead of wrapping around to an old one.
 func atoi(s string) int {
 	n := 0
 	for _, c := range s {
+		if n > (math.MaxInt-9)/10 {
+			return math.MaxInt
+		}
 		n = n*10 + int(c-'0')
 	}
 	return n
@@ -260,15 +270,10 @@ func inodeETag(header http.Header) bool {
 	return true
 }
 
-func etagFindings(ctx context.Context, c *fetch.Client, t target.Target, base fetch.Response) []Finding {
-	if finding, ok := inodeETagFinding(t, base); ok {
-		return []Finding{finding}
-	}
-	for _, path := range []string{"/robots.txt"} {
-		if ctx.Err() != nil {
-			return nil
-		}
-		resp := c.Do(ctx, http.MethodGet, t.Join(path))
+// etagFindings looks for an inode-shaped ETag on the base response, then on
+// /robots.txt.
+func etagFindings(t target.Target, base, robots fetch.Response) []Finding {
+	for _, resp := range []fetch.Response{base, robots} {
 		if finding, ok := inodeETagFinding(t, resp); ok {
 			return []Finding{finding}
 		}
@@ -323,14 +328,31 @@ func negotiationFindings(ctx context.Context, c *fetch.Client, t target.Target) 
 	return out
 }
 
-// bannerWatch keeps the first Server value seen on a target and reports the
-// first later value that differs. Microsoft-HTTPAPI/2.0 is the banner IIS
-// sends when a request misses the site binding, so it is not a change.
+// httpAPIBanner is what IIS sends when a request misses the site binding, so
+// it is not a change of server.
+const httpAPIBanner = "Microsoft-HTTPAPI/2.0"
+
+// bannerWatch reports a Server value that differs from the base response's.
+// Responses arrive in any order during a scan, so the choice is made at the
+// end from everything seen: the differing value on the lowest URL. When the
+// base response sent no Server header, the value on the lowest URL stands in
+// for it.
 type bannerWatch struct {
-	mu    sync.Mutex
-	base  string
+	mu   sync.Mutex
+	base string
+	// first is the base response's Server value, or empty.
 	first string
-	found *Finding
+	// seen holds, for each other Server value, the response with the lowest
+	// URL that carried it.
+	seen map[string]Finding
+}
+
+func newBannerWatch(base string, resp fetch.Response) *bannerWatch {
+	return &bannerWatch{
+		base:  base,
+		first: strings.TrimSpace(resp.Header.Get("Server")),
+		seen:  map[string]Finding{},
+	}
 }
 
 func (b *bannerWatch) observe(resp fetch.Response) {
@@ -338,31 +360,51 @@ func (b *bannerWatch) observe(resp fetch.Response) {
 		return
 	}
 	server := strings.TrimSpace(resp.Header.Get("Server"))
-	if server == "" {
+	if server == "" || server == httpAPIBanner {
 		return
 	}
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	if b.first == "" {
-		b.first = server
+	if server == b.first {
 		return
 	}
-	if b.found != nil || server == b.first || server == "Microsoft-HTTPAPI/2.0" {
-		return
+	at := Finding{URL: resp.URL, Status: resp.Status}
+	if have, ok := b.seen[server]; !ok || bannerBefore(at, have) {
+		b.seen[server] = at
 	}
-	b.found = &Finding{
-		ID: "banner-change", Target: b.base, URL: resp.URL, Status: resp.Status,
-		Message: "Server banner changed from '" + b.first + "' to '" + server + "'",
+}
+
+func bannerBefore(a, b Finding) bool {
+	if a.URL != b.URL {
+		return a.URL < b.URL
 	}
+	return a.Status < b.Status
 }
 
 func (b *bannerWatch) finding() []Finding {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	if b.found == nil {
+	servers := slices.SortedFunc(maps.Keys(b.seen), func(x, y string) int {
+		switch {
+		case bannerBefore(b.seen[x], b.seen[y]):
+			return -1
+		case bannerBefore(b.seen[y], b.seen[x]):
+			return 1
+		}
+		return strings.Compare(x, y)
+	})
+	from := b.first
+	if from == "" && len(servers) > 0 {
+		from, servers = servers[0], servers[1:]
+	}
+	if len(servers) == 0 {
 		return nil
 	}
-	return []Finding{*b.found}
+	to := servers[0]
+	return []Finding{{
+		ID: "banner-change", Target: b.base, URL: b.seen[to].URL, Status: b.seen[to].Status,
+		Message: "Server banner changed from '" + from + "' to '" + to + "'",
+	}}
 }
 
 var phpCreditIDs = []string{
@@ -448,47 +490,14 @@ func ipLinkFindings(ctx context.Context, t target.Target, baseResp fetch.Respons
 // fetchWithHost dials the original host and sets Host to address, so a
 // name-based site and its address-based virtual host can be compared.
 func fetchWithHost(ctx context.Context, t target.Target, host string, timeout time.Duration) (fetch.Response, bool) {
-	conn, err := discover.Dial(ctx, t.Scheme, t.Host, t.Port, timeout)
-	if err != nil || conn == nil {
-		return fetch.Response{}, false
-	}
-	if t.Scheme == "https" {
-		tlsConn := tls.Client(conn, &tls.Config{
-			ServerName:         t.Host,
-			InsecureSkipVerify: true,
-			MinVersion:         tls.VersionTLS10,
-		})
-		if err := tlsConn.HandshakeContext(ctx); err != nil {
-			conn.Close()
-			return fetch.Response{}, false
-		}
-		conn = tlsConn
-	}
-	defer conn.Close()
 	path := t.Join("/")
-	if path == "" {
-		path = "/"
-	}
-	uri, err := t.RequestURI(path)
-	if err != nil {
-		return fetch.Response{}, false
-	}
 	asked := t
 	asked.Host = host
-	if _, err := io.WriteString(conn, "GET "+uri+" HTTP/1.1\r\nHost: "+asked.RequestHost()+"\r\nConnection: close\r\n\r\n"); err != nil {
-		return fetch.Response{}, false
-	}
-	parsed, err := http.ReadResponse(bufio.NewReader(conn), nil)
+	resp, err := rawExchange(ctx, t, rawRequest{method: http.MethodGet, path: path, host: asked.RequestHost()}, timeout)
 	if err != nil {
 		return fetch.Response{}, false
 	}
-	defer parsed.Body.Close()
-	_, _ = io.Copy(io.Discard, io.LimitReader(parsed.Body, 4096))
-	return fetch.Response{
-		Status: parsed.StatusCode,
-		Header: parsed.Header.Clone(),
-		URL:    asked.URL(path),
-	}, true
+	return fetch.Response{Status: resp.status, Header: resp.header, URL: asked.URL(path)}, true
 }
 
 func acaoFindings(ctx context.Context, c *fetch.Client, t target.Target, baseResp fetch.Response) []Finding {
@@ -576,7 +585,7 @@ func methodsFrom(values []string) string {
 	seen := map[string]bool{}
 	var out []string
 	for _, v := range values {
-		for _, part := range strings.Split(v, ",") {
+		for part := range strings.SplitSeq(v, ",") {
 			method := strings.TrimSpace(part)
 			if method == "" {
 				continue
@@ -656,45 +665,11 @@ func internalIPFindings(ctx context.Context, t target.Target, timeout time.Durat
 // door that requires Host can hand that request to a different origin,
 // which may set a session cookie and use its own Server banner.
 func hostlessMethod(ctx context.Context, t target.Target, method string, timeout time.Duration) (fetch.Response, bool) {
-	conn, err := discover.Dial(ctx, t.Scheme, t.Host, t.Port, timeout)
-	if err != nil || conn == nil {
-		return fetch.Response{}, false
-	}
-	if t.Scheme == "https" {
-		tlsConn := tls.Client(conn, &tls.Config{
-			ServerName:         t.Host,
-			InsecureSkipVerify: true,
-			MinVersion:         tls.VersionTLS10,
-		})
-		if err := tlsConn.HandshakeContext(ctx); err != nil {
-			conn.Close()
-			return fetch.Response{}, false
-		}
-		conn = tlsConn
-	}
-	defer conn.Close()
-	path := t.Join("/")
-	if path == "" {
-		path = "/"
-	}
-	uri, err := t.RequestURI(path)
+	resp, err := rawExchange(ctx, t, rawRequest{method: method, path: t.Join("/")}, timeout)
 	if err != nil {
 		return fetch.Response{}, false
 	}
-	if _, err := io.WriteString(conn, method+" "+uri+" HTTP/1.0\r\n\r\n"); err != nil {
-		return fetch.Response{}, false
-	}
-	parsed, err := http.ReadResponse(bufio.NewReader(conn), nil)
-	if err != nil {
-		return fetch.Response{}, false
-	}
-	defer parsed.Body.Close()
-	_, _ = io.Copy(io.Discard, io.LimitReader(parsed.Body, 4096))
-	return fetch.Response{
-		Status: parsed.StatusCode,
-		Header: parsed.Header.Clone(),
-		URL:    t.BaseURL(),
-	}, true
+	return fetch.Response{Status: resp.status, Header: resp.header, URL: t.BaseURL()}, true
 }
 
 func unseenCookies(have, extra []Finding) []Finding {
@@ -717,31 +692,82 @@ func unseenCookies(have, extra []Finding) []Finding {
 }
 
 func http10NoHost(ctx context.Context, t target.Target, path string, timeout time.Duration) (status int, header http.Header, body string, err error) {
-	conn, err := discover.Dial(ctx, "http", t.Host, t.Port, timeout)
+	resp, err := rawExchange(ctx, t, rawRequest{method: http.MethodGet, path: path}, timeout)
 	if err != nil {
 		return 0, nil, "", err
+	}
+	if resp.bodyErr != nil && resp.body == "" {
+		return 0, nil, "", resp.bodyErr
+	}
+	return resp.status, resp.header, resp.body, nil
+}
+
+// rawBodyCap is how much of a raw probe's body is read.
+const rawBodyCap = 4096
+
+// rawRequest is one request written straight to the socket, for the probes
+// net/http will not send as asked: no Host header at all, or a Host that
+// differs from the name that was dialed.
+type rawRequest struct {
+	method string
+	// path is already joined to the target root.
+	path string
+	// host is the Host header of an HTTP/1.1 request. Empty sends HTTP/1.0
+	// with no Host header.
+	host string
+}
+
+type rawResponse struct {
+	status int
+	header http.Header
+	// body is at most rawBodyCap bytes. bodyErr is the read error, if any;
+	// the status and header are still what the server sent.
+	body    string
+	bodyErr error
+}
+
+// rawExchange dials t, completes TLS for an https target, sends req, and
+// reads one response.
+func rawExchange(ctx context.Context, t target.Target, req rawRequest, timeout time.Duration) (rawResponse, error) {
+	uri, err := t.RequestURI(req.path)
+	if err != nil {
+		return rawResponse{}, err
+	}
+	conn, err := discover.Dial(ctx, t.Scheme, t.Host, t.Port, timeout)
+	if err != nil {
+		return rawResponse{}, err
 	}
 	if conn == nil {
-		return 0, nil, "", fmt.Errorf("no connection")
+		return rawResponse{}, fmt.Errorf("no connection")
 	}
 	defer conn.Close()
-	uri, err := t.RequestURI(path)
-	if err != nil {
-		return 0, nil, "", err
+	defer discover.OnCancel(ctx, conn)()
+	if t.Scheme == "https" {
+		tlsConn := tls.Client(conn, discover.TLSConfig(t.Host))
+		if err := tlsConn.HandshakeContext(ctx); err != nil {
+			return rawResponse{}, err
+		}
+		conn = tlsConn
 	}
-	if _, err := io.WriteString(conn, "GET "+uri+" HTTP/1.0\r\n\r\n"); err != nil {
-		return 0, nil, "", err
+	head := req.method + " " + uri + " HTTP/1.0\r\n\r\n"
+	if req.host != "" {
+		head = req.method + " " + uri + " HTTP/1.1\r\nHost: " + req.host + "\r\nConnection: close\r\n\r\n"
+	}
+	if _, err := io.WriteString(conn, head); err != nil {
+		return rawResponse{}, err
 	}
 	parsed, err := http.ReadResponse(bufio.NewReader(conn), nil)
 	if err != nil {
-		return 0, nil, "", err
+		return rawResponse{}, err
 	}
 	defer parsed.Body.Close()
-	buf, readErr := io.ReadAll(io.LimitReader(parsed.Body, 4096))
-	if readErr != nil && len(buf) == 0 {
-		return 0, nil, "", readErr
-	}
-	return parsed.StatusCode, parsed.Header.Clone(), string(buf), nil
+	buf, readErr := io.ReadAll(io.LimitReader(parsed.Body, rawBodyCap))
+	return rawResponse{
+		status:  parsed.StatusCode,
+		header:  parsed.Header.Clone(),
+		body:    string(buf),
+		bodyErr: readErr,
+	}, nil
 }
 
 func cookieFindings(t target.Target, resp fetch.Response) []Finding {
@@ -832,8 +858,8 @@ func wildcardDNS(leaf *x509.Certificate) string {
 	return ""
 }
 
-func robotsFindings(ctx context.Context, c *fetch.Client, t target.Target, soft string, softOK bool) []Finding {
-	resp := c.Do(ctx, http.MethodGet, t.Join("/robots.txt"))
+// robotsFindings fetches the Disallow paths in resp, the /robots.txt response.
+func robotsFindings(ctx context.Context, c *fetch.Client, t target.Target, resp fetch.Response, concurrency int, soft string, softOK bool) []Finding {
 	if resp.Err != nil || resp.Status != http.StatusOK {
 		return nil
 	}
@@ -849,23 +875,26 @@ func robotsFindings(ctx context.Context, c *fetch.Client, t target.Target, soft 
 			Message: "A robots.txt page is readable",
 		})
 	}
-	for _, p := range paths {
+	// Fetched together, reported in robots.txt order. A path that is not
+	// readable leaves its slot empty.
+	pages := make([]Finding, len(paths))
+	parallel.Each(len(paths), concurrency, func(i int) {
 		if ctx.Err() != nil {
-			return out
+			return
 		}
-		page := c.Do(ctx, http.MethodGet, t.Join(p))
+		page := c.Do(ctx, http.MethodGet, t.Join(paths[i]))
 		if page.Err != nil || page.Status != http.StatusOK {
-			continue
+			return
 		}
 		if softOK && fingerprint(page.Body) == soft {
-			continue
+			return
 		}
-		out = append(out, Finding{
+		pages[i] = Finding{
 			ID: "robots-disallow", Target: base, URL: page.URL, Status: page.Status,
 			Message: "A robots.txt page is readable",
-		})
-	}
-	return out
+		}
+	})
+	return append(out, withoutEmpty(pages)...)
 }
 
 func disallowPaths(body string) []string {
@@ -882,13 +911,16 @@ func disallowPaths(body string) []string {
 		if !strings.HasPrefix(lower, key) {
 			continue
 		}
-		// "/" is the site itself, so it is not a hidden path worth a second fetch.
 		path := strings.TrimSpace(line[len(key):])
-		if path == "" || path == "/" || seen[path] || strings.Contains(path, "://") {
+		if path == "" || strings.Contains(path, "://") {
 			continue
 		}
 		if !strings.HasPrefix(path, "/") {
 			path = "/" + path
+		}
+		// "/" is the site itself, so it is not a hidden path worth a second fetch.
+		if path == "/" || seen[path] {
+			continue
 		}
 		seen[path] = true
 		out = append(out, path)

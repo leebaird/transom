@@ -10,10 +10,14 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"runtime/debug"
+	"slices"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 
+	"github.com/leebaird/transom"
 	"github.com/leebaird/transom/internal/check"
 	"github.com/leebaird/transom/internal/discover"
 	"github.com/leebaird/transom/internal/fetch"
@@ -74,214 +78,257 @@ func (f *headerFlag) Set(s string) error {
 }
 
 func run(args []string, stdout, stderr io.Writer) int {
-	for _, a := range args {
-		if a == "version" || a == "--version" || a == "-version" {
-			fmt.Fprintln(stdout, "Transom")
-			return 0
-		}
+	if slices.ContainsFunc(args, isVersionArg) {
+		fmt.Fprintln(stdout, versionLine(debug.ReadBuildInfo()))
+		return 0
+	}
+	cfg, ok := parseFlags(args, stderr)
+	if !ok {
+		return 1
+	}
+	checks, err := loadChecks(cfg.checksDir, stderr)
+	if err != nil {
+		fmt.Fprintln(stderr, err)
+		return 1
 	}
 
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	// The first signal winds the scan down and writes the report. Handing
+	// signals back then lets a second one end the program at once.
+	context.AfterFunc(ctx, stop)
+
+	s := &scanner{cfg: cfg, checks: checks, stdout: stdout, stderr: stderr}
+	s.doc.Command = formatCommand(append([]string{os.Args[0]}, args...))
+	s.doc.Started = time.Now()
+	for _, raw := range cfg.targets {
+		if ctx.Err() != nil {
+			s.interrupted = true
+			break
+		}
+		if !s.scanTarget(ctx, raw) {
+			break
+		}
+	}
+	s.doc.Finished = time.Now()
+	s.doc.Interrupted = s.interrupted
+
+	if err := writeReport(cfg, s.doc); err != nil {
+		fmt.Fprintln(stderr, err)
+		return 1
+	}
+	if s.interrupted {
+		return 2
+	}
+	if s.failed {
+		return 1
+	}
+	return 0
+}
+
+func isVersionArg(a string) bool {
+	return a == "version" || a == "--version" || a == "-version"
+}
+
+// versionLine is the program name and the module version the Go toolchain
+// stamped into the binary: a tag, or a pseudo-version naming the commit. A
+// binary with no build information prints the name alone.
+func versionLine(info *debug.BuildInfo, ok bool) string {
+	if !ok || info.Main.Version == "" {
+		return "Transom"
+	}
+	return "Transom " + info.Main.Version
+}
+
+// config is the parsed command line.
+type config struct {
+	targets     []string
+	ports       string
+	checksDir   string
+	timeout     time.Duration
+	concurrency int
+	fetch       fetch.Options
+	format      string
+	output      string
+}
+
+// parseFlags reports a bad command line on stderr and returns false.
+func parseFlags(args []string, stderr io.Writer) (config, bool) {
+	var cfg config
 	fs := flag.NewFlagSet("transom", flag.ContinueOnError)
 	fs.SetOutput(stderr)
-	portsFlag := fs.String("ports", "", "comma-separated discovery ports")
-	timeout := fs.Duration("timeout", 10*time.Second, "deadline for one request or port probe")
-	concurrency := fs.Int("concurrency", 8, "in-flight requests")
-	uaFlag := fs.String("user-agent", "", "User-Agent (default Discover's latest Edge UA)")
-	follow := fs.String("follow", "same-host", "off or same-host")
-	maxBody := fs.Int64("max-body", 1<<20, "maximum response body")
-	checksDir := fs.String("checks", "", "JSON check directory")
-	formatFlag := fs.String("format", "", "json or htm")
-	output := fs.String("o", "", "report path")
+	fs.StringVar(&cfg.ports, "ports", "", "comma-separated discovery ports")
+	fs.DurationVar(&cfg.timeout, "timeout", 10*time.Second, "deadline for one request or port probe")
+	fs.IntVar(&cfg.concurrency, "concurrency", 8, "in-flight requests")
+	fs.StringVar(&cfg.fetch.UserAgent, "user-agent", "", "User-Agent (default Discover's latest Edge UA)")
+	fs.StringVar(&cfg.fetch.Follow, "follow", "same-host", "off or same-host")
+	fs.Int64Var(&cfg.fetch.MaxBody, "max-body", 1<<20, "maximum response body")
+	fs.StringVar(&cfg.checksDir, "checks", "", "JSON check directory")
+	fs.StringVar(&cfg.format, "format", "", "json or htm")
+	fs.StringVar(&cfg.output, "o", "", "report path")
 	var headers headerFlag
 	fs.Var(&headers, "header", "repeatable Name: value")
 	fs.Usage = func() { fmt.Fprint(stderr, usageText) }
 	if err := fs.Parse(args); err != nil {
-		return 1
+		return config{}, false
 	}
-	if *follow != "off" && *follow != "same-host" {
-		fmt.Fprintln(stderr, "follow must be off or same-host")
-		return 1
+	var problem string
+	switch {
+	case cfg.fetch.Follow != "off" && cfg.fetch.Follow != "same-host":
+		problem = "follow must be off or same-host"
+	case cfg.concurrency < 1:
+		problem = "concurrency must be at least 1"
+	case cfg.timeout <= 0:
+		problem = "timeout must be positive"
+	case cfg.fetch.MaxBody < 0:
+		problem = "max-body must be zero or positive"
 	}
-	if *concurrency < 1 {
-		fmt.Fprintln(stderr, "concurrency must be at least 1")
-		return 1
+	if problem != "" {
+		fmt.Fprintln(stderr, problem)
+		return config{}, false
 	}
-	if *timeout <= 0 {
-		fmt.Fprintln(stderr, "timeout must be positive")
-		return 1
-	}
-	if *maxBody < 0 {
-		fmt.Fprintln(stderr, "max-body must be zero or positive")
-		return 1
-	}
-	targets := fs.Args()
-	if len(targets) == 0 {
+	cfg.targets = fs.Args()
+	if len(cfg.targets) == 0 {
 		fs.Usage()
-		return 1
+		return config{}, false
 	}
-	var ports []int
-	loadPorts := func() ([]int, error) {
-		if ports != nil {
-			return ports, nil
-		}
-		if *portsFlag != "" {
-			parsed, err := discover.ParsePorts(*portsFlag)
-			if err != nil {
-				return nil, err
-			}
-			ports = parsed
-			return ports, nil
-		}
-		path, err := resolveFile("ports.txt")
-		if err != nil {
-			return nil, err
-		}
-		parsed, err := discover.LoadPorts(path)
-		if err != nil {
-			return nil, err
-		}
-		ports = parsed
-		return ports, nil
+	if cfg.fetch.UserAgent == "" {
+		cfg.fetch.UserAgent = discoverUserAgent()
 	}
-	dir, err := resolveChecks(*checksDir)
+	cfg.fetch.Timeout = cfg.timeout
+	cfg.fetch.Concurrency = cfg.concurrency
+	cfg.fetch.Headers = headers.h
+	return cfg, true
+}
+
+// scanner carries one run: the findings so far and how the run has gone.
+type scanner struct {
+	cfg            config
+	checks         []check.Check
+	stdout, stderr io.Writer
+	// ports is the discovery list, loaded on the first target that needs it.
+	ports       []int
+	doc         report.Document
+	failed      bool
+	interrupted bool
+}
+
+func (s *scanner) failf(format string, args ...any) {
+	fmt.Fprintf(s.stderr, format, args...)
+	s.failed = true
+}
+
+// scanTarget scans one command-line target. It returns false when the run
+// should stop instead of moving on to the next target.
+func (s *scanner) scanTarget(ctx context.Context, raw string) bool {
+	tg, err := target.Parse(raw)
 	if err != nil {
-		fmt.Fprintln(stderr, err)
-		return 1
+		s.failf("%s: %v\n", raw, err)
+		return true
 	}
-	checks, err := check.LoadDir(dir)
-	if err != nil {
-		fmt.Fprintln(stderr, err)
-		return 1
+	if tg.Discover {
+		if err := s.loadPorts(); err != nil {
+			s.failf("%v\n", err)
+			return false
+		}
 	}
-
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
-	defer stop()
-
-	started := time.Now()
-	doc := report.Document{
-		Command: formatCommand(append([]string{os.Args[0]}, args...)),
-		Started: started,
+	origins, probed, err := resolve(ctx, tg, s.ports, s.cfg.concurrency, s.cfg.timeout)
+	if errors.Is(err, context.Canceled) {
+		s.interrupted = true
 	}
-	var failed bool
-	interrupted := false
-
-	ua := *uaFlag
-	if ua == "" {
-		ua = discoverUserAgent()
+	if len(origins) == 0 {
+		switch {
+		case s.interrupted:
+			return false
+		case err != nil:
+			s.failf("%s: %v\n", raw, err)
+		default:
+			s.failf("%s: no HTTP service\n", raw)
+		}
+		return true
 	}
-	opts := fetch.Options{
-		Timeout:     *timeout,
-		Follow:      *follow,
-		MaxBody:     *maxBody,
-		UserAgent:   ua,
-		Headers:     headers.h,
-		Concurrency: *concurrency,
-	}
-
-targets:
-	for _, raw := range targets {
-		if ctx.Err() != nil {
-			interrupted = true
-			break
-		}
-		tg, err := target.Parse(raw)
-		if err != nil {
-			fmt.Fprintf(stderr, "%s: %v\n", raw, err)
-			failed = true
-			continue
-		}
-		var origins []target.Target
-		var probed bool
-		if tg.Discover {
-			ports, err = loadPorts()
-			if err != nil {
-				fmt.Fprintln(stderr, err)
-				failed = true
-				break
-			}
-		}
-		origins, probed, err = resolve(ctx, tg, ports, *concurrency, *timeout)
-		if errors.Is(err, context.Canceled) {
-			interrupted = true
-		}
-		if err != nil && !interrupted && len(origins) == 0 {
-			fmt.Fprintf(stderr, "%s: %v\n", raw, err)
-			failed = true
-			continue
-		}
-		if len(origins) == 0 {
-			if interrupted {
-				break
-			}
-			fmt.Fprintf(stderr, "%s: no HTTP service\n", raw)
-			failed = true
-			continue
-		}
-		if probed {
-			for _, o := range origins {
-				fmt.Fprintf(stdout, "%s %s\n", o.HostPort(), o.Scheme)
-			}
-		}
+	if probed {
 		for _, o := range origins {
-			doc.Targets = append(doc.Targets, report.Target{Host: o.Host, Port: o.Port, Scheme: o.Scheme, Root: o.Root})
-			if interrupted || ctx.Err() != nil {
-				interrupted = true
-				break targets
-			}
-			client, err := fetch.New(o, opts)
-			if err != nil {
-				fmt.Fprintf(stderr, "%s: %v\n", o.HostPort(), err)
-				failed = true
-				continue
-			}
-			findings, err := check.Run(ctx, o, client, checks, *concurrency)
-			if werr := report.WriteText(stdout, findings); werr != nil {
-				fmt.Fprintln(stderr, werr)
-				doc.Findings = append(doc.Findings, findings...)
-				failed = true
-				break targets
-			}
-			doc.Findings = append(doc.Findings, findings...)
-			if errors.Is(err, context.Canceled) {
-				interrupted = true
-				break targets
-			}
-			if err != nil {
-				fmt.Fprintf(stderr, "%s: %v\n", o.HostPort(), err)
-				failed = true
-			}
-		}
-		if interrupted {
-			break
+			fmt.Fprintf(s.stdout, "%s %s\n", o.HostPort(), o.Scheme)
 		}
 	}
+	for _, o := range origins {
+		s.doc.Targets = append(s.doc.Targets, report.Target{Host: o.Host, Port: o.Port, Scheme: o.Scheme, Root: o.Root})
+		if s.interrupted || ctx.Err() != nil {
+			s.interrupted = true
+			return false
+		}
+		if !s.scanOrigin(ctx, o) {
+			return false
+		}
+	}
+	return true
+}
 
-	doc.Finished = time.Now()
-	doc.Interrupted = interrupted
-	if *output != "" {
-		kind, err := reportFormat(*formatFlag, *output)
-		if err != nil {
-			fmt.Fprintln(stderr, err)
-			return 1
-		}
-		var werr error
-		if kind == "htm" {
-			werr = report.WriteHTML(*output, doc)
-		} else {
-			werr = report.WriteJSON(*output, doc)
-		}
-		if werr != nil {
-			fmt.Fprintf(stderr, "write report: %v\n", werr)
-			return 1
-		}
+// scanOrigin runs every check against one origin and prints its findings.
+// It returns false when the run should stop.
+func (s *scanner) scanOrigin(ctx context.Context, o target.Target) bool {
+	client, err := fetch.New(o, s.cfg.fetch)
+	if err != nil {
+		s.failf("%s: %v\n", o.HostPort(), err)
+		return true
 	}
-	if interrupted {
-		return 2
+	defer client.Close()
+	findings, err := check.Run(ctx, o, client, s.checks, s.cfg.concurrency)
+	s.doc.Findings = append(s.doc.Findings, findings...)
+	if werr := report.WriteText(s.stdout, findings); werr != nil {
+		s.failf("%v\n", werr)
+		return false
 	}
-	if failed {
-		return 1
+	if errors.Is(err, context.Canceled) {
+		s.interrupted = true
+		return false
 	}
-	return 0
+	if err != nil {
+		s.failf("%s: %v\n", o.HostPort(), err)
+	}
+	return true
+}
+
+// loadPorts fills s.ports from --ports, then a ports.txt next to the program
+// or in the current directory, then the list built into the binary. One taken
+// from the current directory is announced on stderr.
+func (s *scanner) loadPorts() error {
+	if s.ports != nil {
+		return nil
+	}
+	var err error
+	if s.cfg.ports != "" {
+		s.ports, err = discover.ParsePorts(s.cfg.ports)
+	} else if found := overrides("ports.txt", false); len(found) > 0 {
+		if found[0].inCwd {
+			fmt.Fprintf(s.stderr, "using ./%s in the current directory, not the built-in ports\n", found[0].path)
+		}
+		s.ports, err = discover.LoadPorts(found[0].path)
+	} else {
+		s.ports, err = discover.ParsePortList("built-in ports.txt", transom.Ports)
+	}
+	return err
+}
+
+// writeReport writes the -o file, if one was asked for.
+func writeReport(cfg config, doc report.Document) error {
+	if cfg.output == "" {
+		return nil
+	}
+	kind, err := reportFormat(cfg.format, cfg.output)
+	if err != nil {
+		return err
+	}
+	if kind == "htm" {
+		err = report.WriteHTML(cfg.output, doc)
+	} else {
+		err = report.WriteJSON(cfg.output, doc)
+	}
+	if err != nil {
+		return fmt.Errorf("write report: %w", err)
+	}
+	return nil
 }
 
 // resolve returns origins and whether the scheme was learned by a probe.
@@ -341,31 +388,46 @@ func reportFormat(flag, path string) (string, error) {
 	return kind, nil
 }
 
-func resolveFile(name string) (string, error) {
-	if exe, err := os.Executable(); err == nil {
-		candidate := filepath.Join(filepath.Dir(exe), name)
-		if st, err := os.Stat(candidate); err == nil && !st.IsDir() {
-			return candidate, nil
-		}
-	}
-	if st, err := os.Stat(name); err == nil && !st.IsDir() {
-		return name, nil
-	}
-	return "", fmt.Errorf("no %s next to the program or in the current directory", name)
+// override is a file or directory on disk that replaces a built-in default.
+type override struct {
+	path string
+	// inCwd is set for one found in the current directory, where a file
+	// with the right name may have nothing to do with Transom.
+	inCwd bool
 }
 
-func resolveChecks(flag string) (string, error) {
-	if flag != "" {
-		return flag, nil
-	}
+// overrides lists what replaces the built-in name, in the order to try them:
+// next to the program, then in the current directory. dir asks for
+// directories and skips files, or the reverse.
+func overrides(name string, dir bool) []override {
+	var found []override
 	if exe, err := os.Executable(); err == nil {
-		candidate := filepath.Join(filepath.Dir(exe), "checks")
-		if st, err := os.Stat(candidate); err == nil && st.IsDir() {
-			return candidate, nil
+		found = append(found, override{path: filepath.Join(filepath.Dir(exe), name)})
+	}
+	found = append(found, override{path: name, inCwd: true})
+	return slices.DeleteFunc(found, func(o override) bool {
+		st, err := os.Stat(o.path)
+		return err != nil || st.IsDir() != dir
+	})
+}
+
+// loadChecks reads --checks, then a checks directory next to the program or
+// in the current directory, then the corpus built into the binary. A
+// directory found by name that holds no checks is passed over, and one taken
+// from the current directory is announced on stderr.
+func loadChecks(flag string, stderr io.Writer) ([]check.Check, error) {
+	if flag != "" {
+		return check.LoadDir(flag)
+	}
+	for _, o := range overrides("checks", true) {
+		checks, err := check.LoadDir(o.path)
+		if err == nil && len(checks) == 0 {
+			continue
 		}
+		if o.inCwd {
+			fmt.Fprintf(stderr, "using ./%s in the current directory, not the built-in checks\n", o.path)
+		}
+		return checks, err
 	}
-	if st, err := os.Stat("checks"); err == nil && st.IsDir() {
-		return "checks", nil
-	}
-	return "", fmt.Errorf("no checks directory; pass --checks")
+	return check.LoadFS(transom.Checks, transom.ChecksDir)
 }

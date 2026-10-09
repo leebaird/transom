@@ -1,0 +1,86 @@
+version: 2
+
+project_name: transom
+
+builds:
+  - main: ./cmd/transom
+    binary: transom
+    env: [CGO_ENABLED=0]
+    # Position-independent executables, so the kernel can load them at a
+    # random address.
+    buildmode: pie
+    flags:
+      - -trimpath
+    ldflags:
+      - -s -w
+    mod_timestamp: "{{ .CommitTimestamp }}"
+    goos:
+      - linux
+      - darwin
+    goarch:
+      - amd64
+      - arm64
+    ignore:
+      - goos: darwin
+        goarch: amd64
+
+archives:
+  - formats: [tar.gz]
+    files:
+      - LICENSE
+      - README.md
+      - ports.txt
+      - checks/*.json
+
+nfpms:
+  - maintainer: Jay Townsend <jay@cybermon.uk>
+    description: Web server scanner that probes common web ports and checks each HTTP or HTTPS origin.
+    homepage: https://github.com/leebaird/transom
+    license: Apache-2.0
+    section: net
+    formats:
+      - deb
+      - rpm
+      - archlinux
+    contents:
+      - src: LICENSE
+        dst: /usr/share/licenses/transom/LICENSE
+        file_info:
+          mode: 0644
+      - src: README.md
+        dst: /usr/share/doc/transom/README.md
+        file_info:
+          mode: 0644
+      # The binary embeds both of these. The copies are a starting point for
+      # --checks and for a ports.txt of your own.
+      - src: ports.txt
+        dst: /usr/share/doc/transom/examples/ports.txt
+        file_info:
+          mode: 0644
+      - src: checks/*.json
+        dst: /usr/share/doc/transom/examples/checks/
+        file_info:
+          mode: 0644
+
+checksum:
+  name_template: checksums.txt
+  # The release workflow builds the macOS installer on a macOS runner and
+  # drops it here before GoReleaser runs. Locally the glob matches nothing.
+  extra_files:
+    - glob: ./build/pkg/*.pkg
+
+release:
+  extra_files:
+    - glob: ./build/pkg/*.pkg
+
+snapshot:
+  version_template: "{{ incpatch .Version }}-next"
+
+changelog:
+  sort: asc
+  filters:
+    exclude:
+      - "^docs:"
+      - "^test:"
+      - "^chore:"
+      - "^ci:"
