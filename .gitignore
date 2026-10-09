@@ -1,11 +1,15 @@
 # go build -o transom ./cmd/transom
 /transom
 
+# make build and goreleaser output
+/build/
+/dist/
+
 # go test -c and coverage profiles
 *.test
 *.out
 
-# interrupted report writes (path.tmp beside -o)
+# interrupted report writes (path.<random>.tmp beside -o)
 *.tmp
 
 # scan reports (-o). .htm and .html are both HTML; other names are JSON.

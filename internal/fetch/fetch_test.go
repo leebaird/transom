@@ -1,7 +1,7 @@
 package fetch
 
 import (
-	"context"
+	"bufio"
 	"crypto/tls"
 	"io"
 	"net"
@@ -32,7 +32,7 @@ func TestHostIncludesNonDefaultPort(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	resp := c.Do(context.Background(), http.MethodGet, "/")
+	resp := c.Do(t.Context(), http.MethodGet, "/")
 	if resp.Err != nil {
 		t.Fatal(resp.Err)
 	}
@@ -57,7 +57,7 @@ func TestSeeOtherBecomesGET(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	resp := c.Do(context.Background(), http.MethodPost, "/start")
+	resp := c.Do(t.Context(), http.MethodPost, "/start")
 	if resp.Err != nil {
 		t.Fatal(resp.Err)
 	}
@@ -83,7 +83,7 @@ func TestOffHostRedirectStops(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	resp := c.Do(context.Background(), http.MethodGet, "/")
+	resp := c.Do(t.Context(), http.MethodGet, "/")
 	if resp.Err != nil {
 		t.Fatal(resp.Err)
 	}
@@ -114,11 +114,11 @@ func TestCookieJarsAreSeparate(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if resp := a.Do(context.Background(), http.MethodGet, "/set"); resp.Err != nil {
+	if resp := a.Do(t.Context(), http.MethodGet, "/set"); resp.Err != nil {
 		t.Fatal(resp.Err)
 	}
-	echoA := a.Do(context.Background(), http.MethodGet, "/echo")
-	echoB := b.Do(context.Background(), http.MethodGet, "/echo")
+	echoA := a.Do(t.Context(), http.MethodGet, "/echo")
+	echoB := b.Do(t.Context(), http.MethodGet, "/echo")
 	if echoA.Err != nil || echoB.Err != nil {
 		t.Fatalf("a %v b %v", echoA.Err, echoB.Err)
 	}
@@ -141,7 +141,7 @@ func TestBodyCap(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	resp := c.Do(context.Background(), http.MethodGet, "/")
+	resp := c.Do(t.Context(), http.MethodGet, "/")
 	if resp.Err != nil {
 		t.Fatal(resp.Err)
 	}
@@ -151,7 +151,7 @@ func TestBodyCap(t *testing.T) {
 }
 
 func TestShortReadKeepsStatus(t *testing.T) {
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	ln, err := (&net.ListenConfig{}).Listen(t.Context(), "tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -170,7 +170,7 @@ func TestShortReadKeepsStatus(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	resp := c.Do(context.Background(), http.MethodGet, "/")
+	resp := c.Do(t.Context(), http.MethodGet, "/")
 	if resp.Err != nil {
 		t.Fatal(resp.Err)
 	}
@@ -179,12 +179,92 @@ func TestShortReadKeepsStatus(t *testing.T) {
 	}
 }
 
+func TestRetriesAnyMethodOnClosedIdleConn(t *testing.T) {
+	ln, err := (&net.ListenConfig{}).Listen(t.Context(), "tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+	var conns atomic.Int64
+	var keySent atomic.Bool
+	go func() {
+		for {
+			conn, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			first := conns.Add(1) == 1
+			go func() {
+				defer conn.Close()
+				br := bufio.NewReader(conn)
+				for served := 0; ; served++ {
+					req, err := http.ReadRequest(br)
+					if err != nil {
+						return
+					}
+					if _, ok := req.Header["Idempotency-Key"]; ok {
+						keySent.Store(true)
+					}
+					// The first connection answers once, then drops the next
+					// request unanswered, as a server does when its keep-alive
+					// timer fires just as the request arrives.
+					if first && served == 1 {
+						return
+					}
+					_, _ = io.WriteString(conn, "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
+				}
+			}()
+		}
+	}()
+	c, err := New(mustParse(t, "http://"+ln.Addr().String()), opts())
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := range 2 {
+		if resp := c.Do(t.Context(), http.MethodPost, "/"); resp.Err != nil || resp.Body != "ok" {
+			t.Fatalf("request %d: %+v", i, resp)
+		}
+	}
+	if conns.Load() != 2 {
+		t.Fatalf("%d connections, want a retry on a second", conns.Load())
+	}
+	if keySent.Load() {
+		t.Fatal("Idempotency-Key was sent on the wire")
+	}
+}
+
+func TestClientPoolMatchesConcurrency(t *testing.T) {
+	for _, tc := range []struct{ concurrency, want int }{
+		{0, http.DefaultMaxIdleConnsPerHost},
+		{1, http.DefaultMaxIdleConnsPerHost},
+		{8, 8},
+		{500, 500},
+	} {
+		o := opts()
+		o.Concurrency = tc.concurrency
+		c, err := New(mustParse(t, "https://example.com"), o)
+		if err != nil {
+			t.Fatal(err)
+		}
+		tr, ok := c.http.Transport.(*http.Transport)
+		if !ok {
+			t.Fatalf("transport %T", c.http.Transport)
+		}
+		if tr.MaxIdleConnsPerHost != tc.want || tr.MaxIdleConns < tc.want {
+			t.Errorf("concurrency %d: per host %d, total %d", tc.concurrency, tr.MaxIdleConnsPerHost, tr.MaxIdleConns)
+		}
+	}
+}
+
 func TestClientAllowsTLS10(t *testing.T) {
 	c, err := New(mustParse(t, "https://example.com"), opts())
 	if err != nil {
 		t.Fatal(err)
 	}
-	tr := c.http.Transport.(*http.Transport)
+	tr, ok := c.http.Transport.(*http.Transport)
+	if !ok {
+		t.Fatalf("transport %T", c.http.Transport)
+	}
 	if tr.TLSClientConfig.MinVersion != tls.VersionTLS10 {
 		t.Fatalf("min version %x", tr.TLSClientConfig.MinVersion)
 	}

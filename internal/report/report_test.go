@@ -2,6 +2,8 @@ package report
 
 import (
 	"encoding/json"
+	"errors"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -27,9 +29,7 @@ func TestWriteJSONReplacesAtomically(t *testing.T) {
 	if err := WriteJSON(path, doc); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := os.Stat(path + ".tmp"); !os.IsNotExist(err) {
-		t.Fatalf("temp file still present: %v", err)
-	}
+	noTempFiles(t, path)
 	data, err := os.ReadFile(path)
 	if err != nil {
 		t.Fatal(err)
@@ -75,9 +75,7 @@ func TestWriteHTML(t *testing.T) {
 	if err := WriteHTML(path, doc); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := os.Stat(path + ".tmp"); !os.IsNotExist(err) {
-		t.Fatalf("temp file still present: %v", err)
-	}
+	noTempFiles(t, path)
 	data, err := os.ReadFile(path)
 	if err != nil {
 		t.Fatal(err)
@@ -166,6 +164,99 @@ func TestWriteHTML(t *testing.T) {
 	}
 	if strings.Contains(body, "<script>alert") {
 		t.Fatal("message was not escaped")
+	}
+}
+
+// noTempFiles fails if a report write left its temp file beside path.
+func noTempFiles(t *testing.T, path string) {
+	t.Helper()
+	left, err := filepath.Glob(path + ".*.tmp")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(left) > 0 {
+		t.Fatalf("temp files still present: %v", left)
+	}
+}
+
+func TestWriteAtomicFailureLeavesNothing(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "report.json")
+	if err := os.WriteFile(path, []byte("old"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	want := errors.New("render failed")
+	err := writeAtomic(path, func(io.Writer) error { return want })
+	if !errors.Is(err, want) {
+		t.Fatalf("err %v", err)
+	}
+	noTempFiles(t, path)
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(data) != "old" {
+		t.Fatalf("report was replaced: %q", data)
+	}
+}
+
+func TestWriteRemovesStaleTempFiles(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "report.json")
+	old := time.Now().Add(-time.Hour)
+	stale := path + ".ABCDEFGHIJKLMNOPQRSTUVWX23.tmp"
+	fresh := path + ".23ABCDEFGHIJKLMNOPQRSTUVWX.tmp"
+	// Names writeAtomic does not make are someone else's, however old.
+	other := path + ".notes.tmp"
+	sibling := filepath.Join(dir, "other.json.ABCDEFGHIJKLMNOPQRSTUVWX23.tmp")
+	for _, name := range []string{stale, fresh, other, sibling} {
+		if err := os.WriteFile(name, []byte("partial"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, name := range []string{stale, other, sibling} {
+		if err := os.Chtimes(name, old, old); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := WriteJSON(path, Document{}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(stale); !os.IsNotExist(err) {
+		t.Fatalf("stale temp file survived: %v", err)
+	}
+	for _, name := range []string{fresh, other, sibling, path} {
+		if _, err := os.Stat(name); err != nil {
+			t.Fatalf("%s: %v", filepath.Base(name), err)
+		}
+	}
+}
+
+func TestHTMLLinkSchemes(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "report.htm")
+	const base = "https://example.com/"
+	doc := Document{
+		Targets: []Target{{Host: "example.com", Port: 443, Scheme: "https", Root: "/"}},
+		Findings: []check.Finding{
+			{ID: "a", Target: base, URL: "javascript:alert(1)", Message: "script link"},
+			{ID: "b", Target: base, URL: `https://example.com/?q="><script>x</script>&r=1`, Message: "markup link"},
+		},
+	}
+	if err := WriteHTML(path, doc); err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	body := string(data)
+	if strings.Contains(body, `href="javascript:`) {
+		t.Fatalf("javascript: URL became a link in\n%s", body)
+	}
+	if strings.Contains(body, "<script>x") {
+		t.Fatalf("URL markup was not escaped in\n%s", body)
+	}
+	if !strings.Contains(body, `href="https://example.com/?q=`) {
+		t.Fatalf("https link missing in\n%s", body)
 	}
 }
 

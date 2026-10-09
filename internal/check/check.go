@@ -5,12 +5,16 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"net/http"
 	"os"
+	"path"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"sort"
 	"strings"
 )
@@ -48,6 +52,33 @@ func LoadDir(dir string) ([]Check, error) {
 	if err != nil {
 		return nil, fmt.Errorf("read checks: %w", err)
 	}
+	return loadEntries(entries, func(name string) ([]Check, error) {
+		file := filepath.Join(dir, name)
+		data, err := os.ReadFile(file)
+		if err != nil {
+			return nil, err
+		}
+		return parseFile(file, data)
+	})
+}
+
+// LoadFS is LoadDir for a directory inside fsys, such as the embedded corpus.
+func LoadFS(fsys fs.FS, dir string) ([]Check, error) {
+	entries, err := fs.ReadDir(fsys, dir)
+	if err != nil {
+		return nil, fmt.Errorf("read checks: %w", err)
+	}
+	return loadEntries(entries, func(name string) ([]Check, error) {
+		p := path.Join(dir, name)
+		data, err := fs.ReadFile(fsys, p)
+		if err != nil {
+			return nil, err
+		}
+		return parseFile(p, data)
+	})
+}
+
+func loadEntries(entries []fs.DirEntry, load func(name string) ([]Check, error)) ([]Check, error) {
 	var names []string
 	for _, e := range entries {
 		if e.IsDir() || !strings.HasSuffix(e.Name(), ".json") {
@@ -59,8 +90,7 @@ func LoadDir(dir string) ([]Check, error) {
 	var out []Check
 	seen := map[string]string{}
 	for _, name := range names {
-		path := filepath.Join(dir, name)
-		batch, err := loadFile(path)
+		batch, err := load(name)
 		if err != nil {
 			return nil, err
 		}
@@ -75,22 +105,19 @@ func LoadDir(dir string) ([]Check, error) {
 	return out, nil
 }
 
-func loadFile(path string) ([]Check, error) {
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return nil, err
-	}
+// parseFile decodes one file's checks. label names the file in errors.
+func parseFile(label string, data []byte) ([]Check, error) {
 	dec := json.NewDecoder(bytes.NewReader(data))
 	dec.DisallowUnknownFields()
 	var raw []json.RawMessage
 	if err := dec.Decode(&raw); err != nil {
-		return nil, fmt.Errorf("%s: %w", path, err)
+		return nil, fmt.Errorf("%s: %w", label, err)
 	}
-	if err := dec.Decode(&struct{}{}); err != io.EOF {
+	if err := dec.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
 		if err == nil {
-			return nil, fmt.Errorf("%s: trailing data", path)
+			return nil, fmt.Errorf("%s: trailing data", label)
 		}
-		return nil, fmt.Errorf("%s: %w", path, err)
+		return nil, fmt.Errorf("%s: %w", label, err)
 	}
 	out := make([]Check, 0, len(raw))
 	for _, msg := range raw {
@@ -98,10 +125,10 @@ func loadFile(path string) ([]Check, error) {
 		dec.DisallowUnknownFields()
 		var c Check
 		if err := dec.Decode(&c); err != nil {
-			return nil, fmt.Errorf("%s: %w", path, err)
+			return nil, fmt.Errorf("%s: %w", label, err)
 		}
 		if err := c.compile(); err != nil {
-			return nil, fmt.Errorf("%s: %w", path, err)
+			return nil, fmt.Errorf("%s: %w", label, err)
 		}
 		out = append(out, c)
 	}
@@ -214,12 +241,7 @@ func rawHexPrefix(expr string) ([]byte, bool) {
 }
 
 func statusListed(list []int, status int) bool {
-	for _, s := range list {
-		if s == status {
-			return true
-		}
-	}
-	return false
+	return slices.Contains(list, status)
 }
 
 func joinedHeader(h http.Header, name string) string {

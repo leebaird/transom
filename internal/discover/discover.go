@@ -20,6 +20,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/leebaird/transom/internal/parallel"
 	"github.com/leebaird/transom/internal/target"
 )
 
@@ -32,8 +33,13 @@ func LoadPorts(path string) ([]int, error) {
 	if err != nil {
 		return nil, fmt.Errorf("read ports: %w", err)
 	}
+	return ParsePortList(path, data)
+}
+
+// ParsePortList parses the contents of a ports.txt. name only labels errors.
+func ParsePortList(name string, data []byte) ([]int, error) {
 	var parts []string
-	for _, line := range strings.Split(string(data), "\n") {
+	for line := range strings.SplitSeq(string(data), "\n") {
 		line = strings.TrimSpace(line)
 		if line == "" || strings.HasPrefix(line, "#") {
 			continue
@@ -41,7 +47,7 @@ func LoadPorts(path string) ([]int, error) {
 		if i := strings.IndexByte(line, '#'); i >= 0 {
 			line = strings.TrimSpace(line[:i])
 		}
-		for _, part := range strings.Split(line, ",") {
+		for part := range strings.SplitSeq(line, ",") {
 			part = strings.TrimSpace(part)
 			if part != "" {
 				parts = append(parts, part)
@@ -49,9 +55,13 @@ func LoadPorts(path string) ([]int, error) {
 		}
 	}
 	if len(parts) == 0 {
-		return nil, fmt.Errorf("%s: no ports", path)
+		return nil, fmt.Errorf("%s: no ports", name)
 	}
-	return ParsePorts(strings.Join(parts, ","))
+	ports, err := ParsePorts(strings.Join(parts, ","))
+	if err != nil {
+		return nil, fmt.Errorf("%s: %w", name, err)
+	}
+	return ports, nil
 }
 
 // ParsePorts parses a comma-separated list of ports.
@@ -84,40 +94,24 @@ func ParsePorts(s string) ([]int, error) {
 // fails with a lookup or network error, that error is returned. A refused or
 // unanswered port is a miss.
 func Discover(ctx context.Context, host string, ports []int, concurrency int, timeout time.Duration) ([]target.Target, error) {
-	if concurrency < 1 {
-		concurrency = 1
-	}
 	schemes := make([]string, len(ports))
-	var wg sync.WaitGroup
-	sem := make(chan struct{}, concurrency)
 	var firstErr error
 	var errMu sync.Mutex
-	for i, port := range ports {
+	parallel.Each(len(ports), concurrency, func(i int) {
 		if ctx.Err() != nil {
-			break
+			return
 		}
-		wg.Add(1)
-		go func(i, port int) {
-			defer wg.Done()
-			select {
-			case sem <- struct{}{}:
-				defer func() { <-sem }()
-			case <-ctx.Done():
-				return
+		scheme, err := Probe(ctx, host, ports[i], timeout)
+		if err != nil {
+			errMu.Lock()
+			if firstErr == nil {
+				firstErr = err
 			}
-			scheme, err := Probe(ctx, host, port, timeout)
-			if err != nil {
-				errMu.Lock()
-				if firstErr == nil {
-					firstErr = err
-				}
-				errMu.Unlock()
-				return
-			}
-			schemes[i] = scheme
-		}(i, port)
-	}
-	wg.Wait()
+			errMu.Unlock()
+			return
+		}
+		schemes[i] = scheme
+	})
 	var out []target.Target
 	for i, scheme := range schemes {
 		if scheme == "" {
@@ -144,18 +138,41 @@ func Discover(ctx context.Context, host string, ports []int, concurrency int, ti
 // timeout is the deadline for each dial. Lookup and network errors are returned.
 // A refused connection or a dial that hits timeout is a miss.
 func Probe(ctx context.Context, host string, port int, timeout time.Duration) (string, error) {
+	return probe(ctx, host, port, timeout, dial)
+}
+
+// dialFunc is dial, or a stand-in for it in tests.
+type dialFunc func(ctx context.Context, addr, scheme string, timeout time.Duration) (net.Conn, error)
+
+func probe(ctx context.Context, host string, port int, timeout time.Duration, dial dialFunc) (string, error) {
 	if err := ctx.Err(); err != nil {
 		return "", err
 	}
 	addr := net.JoinHostPort(host, strconv.Itoa(port))
-	ok, err := tlsHello(ctx, addr, host, timeout)
+	conn, err := dial(ctx, addr, "https", timeout)
 	if err != nil {
 		return "", err
 	}
-	if ok {
-		return "https", nil
+	if conn == nil {
+		// Nothing answered. A plaintext dial over the same route would only
+		// wait out the same refusal or timeout a second time.
+		if sameRoute(ctx, addr) {
+			return "", nil
+		}
+	} else {
+		ok, err := tlsHello(ctx, conn, host)
+		if err != nil {
+			return "", err
+		}
+		if ok {
+			return "https", nil
+		}
 	}
-	ok, err = httpHello(ctx, addr, host, port, timeout)
+	conn, err = dial(ctx, addr, "http", timeout)
+	if err != nil || conn == nil {
+		return "", err
+	}
+	ok, err := httpHello(ctx, conn, host, port)
 	if err != nil {
 		return "", err
 	}
@@ -165,58 +182,61 @@ func Probe(ctx context.Context, host string, port int, timeout time.Duration) (s
 	return "", nil
 }
 
-func tlsHello(ctx context.Context, addr, host string, timeout time.Duration) (bool, error) {
-	conn, err := dial(ctx, addr, "https", timeout)
+// sameRoute reports whether a plaintext dial to addr goes the way the TLS
+// dial went: straight to the host both times, or through the same proxy.
+// HTTP_PROXY and HTTPS_PROXY can name different proxies.
+func sameRoute(ctx context.Context, addr string) bool {
+	secure, err := proxyFor(ctx, "https", addr)
 	if err != nil {
-		return false, err
+		return false
 	}
-	if conn == nil {
-		return false, nil
+	plain, err := proxyFor(ctx, "http", addr)
+	if err != nil {
+		return false
 	}
+	if secure == nil || plain == nil {
+		return secure == nil && plain == nil
+	}
+	return secure.String() == plain.String()
+}
+
+// tlsHello reports whether conn completes a TLS handshake. It closes conn.
+func tlsHello(ctx context.Context, conn net.Conn, host string) (bool, error) {
 	defer conn.Close()
+	return handshake(ctx, tls.Client(conn, TLSConfig(host)))
+}
+
+// TLSConfig is the client configuration for every connection to a scanned
+// host. Certificate problems are reported as findings, so a failed verify
+// must not end the scan, and TLS 1.0 is allowed so an old server can still be
+// reached and reported.
+func TLSConfig(host string) *tls.Config {
 	name := host
 	if net.ParseIP(host) != nil {
 		name = ""
 	}
-	tlsConn := tls.Client(conn, &tls.Config{
+	return &tls.Config{
 		ServerName:         name,
-		InsecureSkipVerify: true,
+		InsecureSkipVerify: true, //nolint:gosec // G402: see the comment above
 		MinVersion:         tls.VersionTLS10,
-	})
-	ok, err := handshake(ctx, tlsConn)
-	if err != nil {
-		return false, err
 	}
-	return ok, nil
 }
 
 func handshake(ctx context.Context, conn *tls.Conn) (bool, error) {
-	errc := make(chan error, 1)
-	go func() { errc <- conn.Handshake() }()
-	select {
-	case <-ctx.Done():
-		conn.Close()
-		return false, ctx.Err()
-	case err := <-errc:
-		if err != nil {
-			if ctx.Err() != nil {
-				return false, ctx.Err()
-			}
-			return false, nil
+	if err := conn.HandshakeContext(ctx); err != nil {
+		if ctx.Err() != nil {
+			return false, ctx.Err()
 		}
-		return true, nil
-	}
-}
-
-func httpHello(ctx context.Context, addr, host string, port int, timeout time.Duration) (bool, error) {
-	conn, err := dial(ctx, addr, "http", timeout)
-	if err != nil {
-		return false, err
-	}
-	if conn == nil {
 		return false, nil
 	}
+	return true, nil
+}
+
+// httpHello reports whether conn answers a plaintext request with an HTTP
+// status line. It closes conn.
+func httpHello(ctx context.Context, conn net.Conn, host string, port int) (bool, error) {
 	defer conn.Close()
+	defer OnCancel(ctx, conn)()
 	if deadline, ok := ctx.Deadline(); ok {
 		_ = conn.SetDeadline(deadline)
 	}
@@ -247,6 +267,15 @@ func hostHeader(host string, port int) string {
 	return net.JoinHostPort(host, strconv.Itoa(port))
 }
 
+// OnCancel ends any read or write on conn when ctx is canceled. Reads on a
+// raw connection wait for its deadline, not for a context, so an interrupt
+// would otherwise sit out the whole timeout. Call the result when the
+// exchange is over.
+func OnCancel(ctx context.Context, conn net.Conn) (stop func()) {
+	release := context.AfterFunc(ctx, func() { _ = conn.SetDeadline(time.Now()) })
+	return func() { release() }
+}
+
 // Dial opens a TCP connection to host:port. HTTP_PROXY and HTTPS_PROXY are
 // honored the same way as the scan client, including NO_PROXY. A nil
 // connection and a nil error means the port refused the connection or did
@@ -270,7 +299,7 @@ func dial(ctx context.Context, addr, scheme string, timeout time.Duration) (net.
 			return nil, ctx.Err()
 		}
 		if missErr(err) {
-			return nil, nil
+			return nil, nil //nolint:nilnil // documented on Dial: no connection and no error is a miss
 		}
 		return nil, err
 	}
@@ -309,7 +338,7 @@ func connectProxy(ctx context.Context, proxy *url.URL, addr string) (net.Conn, e
 	if strings.EqualFold(proxy.Scheme, "https") {
 		tlsConn := tls.Client(conn, &tls.Config{ServerName: proxy.Hostname()})
 		if err := tlsConn.HandshakeContext(ctx); err != nil {
-			conn.Close()
+			_ = conn.Close()
 			return nil, err
 		}
 		conn = tlsConn
@@ -325,12 +354,12 @@ func connectProxy(ctx context.Context, proxy *url.URL, addr string) (net.Conn, e
 	}
 	b.WriteString("\r\n")
 	if _, err := io.WriteString(conn, b.String()); err != nil {
-		conn.Close()
+		_ = conn.Close()
 		return nil, err
 	}
 	br := bufio.NewReader(conn)
 	if err := readProxyStatus(br); err != nil {
-		conn.Close()
+		_ = conn.Close()
 		return nil, err
 	}
 	return &bufConn{Conn: conn, r: br}, nil
@@ -378,8 +407,7 @@ func missErr(err error) bool {
 	if err == nil {
 		return false
 	}
-	var dnsErr *net.DNSError
-	if errors.As(err, &dnsErr) {
+	if _, ok := errors.AsType[*net.DNSError](err); ok {
 		return false
 	}
 	if errors.Is(err, syscall.ECONNREFUSED) {

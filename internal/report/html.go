@@ -2,7 +2,6 @@ package report
 
 import (
 	"fmt"
-	"html"
 	"html/template"
 	"io"
 	"strconv"
@@ -41,12 +40,18 @@ type htmlSection struct {
 	Findings []htmlFinding
 }
 
-// htmlFinding is one report table. URLs lists every page for that check and message.
+// htmlFinding is one report table. Links lists every page for that check and message.
 type htmlFinding struct {
 	Message string
 	ID      string
-	Target  string
-	URLs    []string
+	Links   []htmlLink
+}
+
+// htmlLink is one page. Base is set for the target's own URL, which is
+// printed as the word Base instead of a link.
+type htmlLink struct {
+	URL  string
+	Base bool
 }
 
 // discoverStamp matches Discover's human UTC stamp: mm/dd/yyyy - hh:mm Z.
@@ -55,10 +60,7 @@ func discoverStamp(t time.Time) string {
 }
 
 func htmlView(doc Document) htmlViewData {
-	elapsed := doc.Finished.Sub(doc.Started)
-	if elapsed < 0 {
-		elapsed = 0
-	}
+	elapsed := max(doc.Finished.Sub(doc.Started), 0)
 	sections := make([]htmlSection, 0, len(doc.Targets))
 	used := make([]bool, len(doc.Findings))
 	for _, tg := range doc.Targets {
@@ -105,23 +107,22 @@ func sameBase(page, base string) bool {
 // into one table. The links stay in that same order.
 func groupFindings(findings []check.Finding) []htmlFinding {
 	var out []htmlFinding
+	var targets []string
 	index := map[string]int{}
 	for _, f := range findings {
 		key := f.ID + "\x00" + f.Message
-		if i, ok := index[key]; ok {
-			out[i].URLs = append(out[i].URLs, f.URL)
-			continue
+		// Every link in a group is compared with the first finding's target.
+		i, ok := index[key]
+		if !ok {
+			i = len(out)
+			index[key] = i
+			targets = append(targets, f.Target)
+			out = append(out, htmlFinding{Message: f.Message, ID: f.ID})
 		}
-		index[key] = len(out)
-		out = append(out, htmlFinding{
-			Message: f.Message,
-			ID:      f.ID,
-			Target:  f.Target,
-			URLs:    []string{f.URL},
-		})
+		out[i].Links = append(out[i].Links, htmlLink{URL: f.URL, Base: sameBase(f.URL, targets[i])})
 	}
 	for i := range out {
-		out[i].Message = robotsLabel(out[i].Message, len(out[i].URLs))
+		out[i].Message = robotsLabel(out[i].Message, len(out[i].Links))
 	}
 	return out
 }
@@ -133,29 +134,10 @@ func robotsLabel(message string, n int) string {
 	return fmt.Sprintf("%d robots.txt pages are readable", n)
 }
 
-func linkList(urls []string, base string) template.HTML {
-	var b strings.Builder
-	for i, page := range urls {
-		if i > 0 {
-			b.WriteString("<br>")
-		}
-		if sameBase(page, base) {
-			b.WriteString("Base")
-			continue
-		}
-		esc := html.EscapeString(page)
-		b.WriteString(`<a href="`)
-		b.WriteString(esc)
-		b.WriteString(`" target="_blank" rel="noopener">`)
-		b.WriteString(esc)
-		b.WriteString(`</a>`)
-	}
-	return template.HTML(b.String())
-}
-
-var htmlReport = template.Must(template.New("report").Funcs(template.FuncMap{
-	"linkList": linkList,
-}).Parse(`<!DOCTYPE html>
+// The template writes every link itself, so html/template escapes each URL
+// for the attribute and drops a scheme a browser would run, such as
+// javascript:. Finding URLs can come from the scanned server.
+var htmlReport = template.Must(template.New("report").Parse(`<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
@@ -195,7 +177,7 @@ var htmlReport = template.Must(template.New("report").Funcs(template.FuncMap{
 <table class="finding">
   <tr><th>Finding</th><td>{{.Message}}</td></tr>
   <tr><th>Check</th><td>{{.ID}}</td></tr>
-  <tr><th>{{if gt (len .URLs) 1}}Links{{else}}Link{{end}}</th><td>{{linkList .URLs .Target}}</td></tr>
+  <tr><th>{{if gt (len .Links) 1}}Links{{else}}Link{{end}}</th><td>{{range $j, $l := .Links}}{{if $j}}<br>{{end}}{{if $l.Base}}Base{{else}}<a href="{{$l.URL}}" target="_blank" rel="noopener">{{$l.URL}}</a>{{end}}{{end}}</td></tr>
 </table>
 {{end}}
 {{else}}
