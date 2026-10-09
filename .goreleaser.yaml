@@ -6,6 +6,9 @@ builds:
   - main: ./cmd/transom
     binary: transom
     env: [CGO_ENABLED=0]
+    # Position-independent executables, so the kernel can load them at a
+    # random address.
+    buildmode: pie
     flags:
       - -trimpath
     ldflags:

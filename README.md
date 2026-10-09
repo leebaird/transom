@@ -21,6 +21,8 @@ sudo installer -pkg transom_*_darwin_arm64.pkg -target /
 
 The Linux packages install `/usr/bin/transom`. The macOS installer is unsigned and installs `/usr/local/bin/transom`.
 
+Release binaries are position-independent executables. The Linux ones need the glibc loader, so they do not run as they are on a musl system such as Alpine; build from source there.
+
 With Go 1.27 or newer:
 
 ```bash
@@ -149,7 +151,7 @@ go build -o transom ./cmd/transom
 
 Go 1.27 or newer. The module has no third-party dependencies.
 
-`make build` cross-compiles Linux amd64, Linux arm64, and macOS arm64 binaries into `build/`.
+`make build` cross-compiles Linux amd64, Linux arm64, and macOS arm64 binaries into `build/`, as position-independent executables like the release builds.
 
 ## Develop
 
@@ -164,6 +166,7 @@ make vulncheck      # govulncheck, at the version pinned in the Makefile
 make tidy-check
 make release-check  # validate .goreleaser.yaml
 make snapshot       # GoReleaser: every archive and Linux package, into dist/
+make pie-check      # after a snapshot: every binary in dist/ is position independent
 ```
 
 `make lint` and `make fmt-check` need [golangci-lint](https://golangci-lint.run) v2. `make snapshot` and `make release-check` need [GoReleaser](https://goreleaser.com) v2. `make vulncheck` downloads govulncheck. `make pkg-darwin-arm64 VERSION=1.2.3` builds the macOS installer and runs only on macOS, because it calls `pkgbuild`.

@@ -125,3 +125,6 @@ jobs:
       with:
         version: '~> v2'
         args: release --snapshot --clean
+
+    - name: Check the binaries are position independent
+      run: make pie-check
