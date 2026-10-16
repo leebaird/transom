@@ -765,6 +765,85 @@ func TestFindingOrder(t *testing.T) {
 	}
 }
 
+func TestACAOAfterCloudflareTrace(t *testing.T) {
+	findings := []Finding{
+		{ID: "header-acao", URL: "https://example.com/cdn-cgi/trace", Message: "Access-Control-Allow-Origin is *"},
+		{ID: "sitemap-xml", URL: "https://example.com/sitemap.xml", Message: "Sitemap"},
+		{ID: "robots-disallow", URL: "https://example.com/robots.txt", Message: "A robots.txt page is readable"},
+		{ID: "cookie-httponly", URL: "https://example.com/", Message: "The 'ahoy_visitor' cookie is missing an HttpOnly flag"},
+		{ID: "header-csp", URL: "https://example.com/", Message: "Content-Security-Policy is missing"},
+		{ID: "cloudflare-trace", URL: "https://example.com/cdn-cgi/trace", Message: "Cloudflare trace output"},
+		{ID: "phpinfo", URL: "https://example.com/info.php", Message: "phpinfo() output"},
+	}
+	sortFindings(findings)
+	var ids []string
+	for _, f := range findings {
+		ids = append(ids, f.ID)
+	}
+	want := []string{"phpinfo", "cloudflare-trace", "header-acao", "sitemap-xml", "robots-disallow", "cookie-httponly", "header-csp"}
+	if strings.Join(ids, ",") != strings.Join(want, ",") {
+		t.Fatalf("%v", ids)
+	}
+}
+
+func TestControlPanelsBeforeInteresting(t *testing.T) {
+	findings := []Finding{
+		{ID: "webmail", URL: "http://example.com/webmail/", Message: "Web based mail package installed"},
+		{ID: "public-dir", URL: "http://example.com/public/", Message: "This might be interesting"},
+		{ID: "info-dir", URL: "http://example.com/info/", Message: "This might be interesting"},
+		{ID: "securecontrolpanel", URL: "http://example.com/securecontrolpanel/", Message: "Web server control panel"},
+		{ID: "cpanel", URL: "http://example.com/cpanel/", Message: "Web based control panel"},
+		{ID: "outdated-nginx", URL: "http://example.com/", Message: "nginx/1.29.8 is older than the current release 1.31.6"},
+	}
+	sortFindings(findings)
+	var ids []string
+	for _, f := range findings {
+		ids = append(ids, f.ID)
+	}
+	want := []string{"cpanel", "securecontrolpanel", "webmail", "info-dir", "public-dir", "outdated-nginx"}
+	if strings.Join(ids, ",") != strings.Join(want, ",") {
+		t.Fatalf("%v", ids)
+	}
+}
+
+func TestETagBeforeAllowedMethods(t *testing.T) {
+	findings := []Finding{
+		{ID: "options-allow", URL: "http://example.com/", Message: "Allowed HTTP Methods: OPTIONS, HEAD, GET"},
+		{ID: "header-csp", URL: "http://example.com/", Message: "Content-Security-Policy is missing"},
+		{ID: "console", URL: "http://example.com/console", Message: "This might be interesting"},
+		{ID: "etag-inode", URL: "http://example.com/", Message: "ETag leaks an inode"},
+		{ID: "cookie-httponly", URL: "http://example.com/", Message: "The 'SessionID' cookie is missing an HttpOnly flag"},
+		{ID: "phpinfo", URL: "http://example.com/info.php", Message: "phpinfo() output"},
+	}
+	sortFindings(findings)
+	var ids []string
+	for _, f := range findings {
+		ids = append(ids, f.ID)
+	}
+	want := []string{"phpinfo", "console", "cookie-httponly", "header-csp", "etag-inode", "options-allow"}
+	if strings.Join(ids, ",") != strings.Join(want, ",") {
+		t.Fatalf("%v", ids)
+	}
+}
+
+func TestAdminLoginIsFirst(t *testing.T) {
+	findings := []Finding{
+		{ID: "python-samples", Message: "Python sample programs"},
+		{ID: "db-sql", Message: "Exposed database dump"},
+		{ID: "outdated-nginx", Message: "nginx/1.14.0 is older than the current release 1.31.6"},
+		{ID: "header-csp", Message: "Content-Security-Policy is missing"},
+		{ID: "admin-login", URL: "http://example.com/admin/", Message: "Login page"},
+	}
+	sortFindings(findings)
+	if findings[0].ID != "admin-login" {
+		var ids []string
+		for _, f := range findings {
+			ids = append(ids, f.ID)
+		}
+		t.Fatalf("%v", ids)
+	}
+}
+
 func TestLoginPageAfterWebConfig(t *testing.T) {
 	findings := []Finding{
 		{ID: "robots-disallow", Message: "A robots.txt page is readable"},
@@ -836,7 +915,7 @@ func TestHTTPSCookieMissingSecure(t *testing.T) {
 func TestNginxAfterControlPanels(t *testing.T) {
 	findings := []Finding{
 		{ID: "outdated-nginx", Message: "nginx/1.29.8 is older than the current release 1.31.6"},
-		{ID: "cpanel", Message: "Web-based control panel"},
+		{ID: "cpanel", Message: "Web based control panel"},
 		{ID: "info-dir", Message: "This might be interesting"},
 		{ID: "public-dir", Message: "This might be interesting"},
 		{ID: "webmail", Message: "Web based mail package installed"},
@@ -849,7 +928,7 @@ func TestNginxAfterControlPanels(t *testing.T) {
 	for _, f := range findings {
 		ids = append(ids, f.ID)
 	}
-	want := []string{"outdated-apache", "webmail", "securecontrolpanel", "cpanel", "info-dir", "public-dir", "outdated-nginx", "banner-change"}
+	want := []string{"outdated-apache", "cpanel", "securecontrolpanel", "webmail", "info-dir", "public-dir", "outdated-nginx", "banner-change"}
 	if strings.Join(ids, ",") != strings.Join(want, ",") {
 		t.Fatalf("%v", ids)
 	}

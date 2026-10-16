@@ -143,6 +143,9 @@ func Run(ctx context.Context, t target.Target, client *fetch.Client, checks []Ch
 
 func findingRank(id string) int {
 	switch {
+	// A Basic-auth login is the first row.
+	case id == "admin-login":
+		return -1
 	case id == "db-sql":
 		return 0
 	case id == "outdated-nginx":
@@ -151,7 +154,7 @@ func findingRank(id string) int {
 		return 1
 	case id == "internal-ip":
 		return 2
-	case strings.HasPrefix(id, "header-"), strings.HasPrefix(id, "cookie-"), strings.HasPrefix(id, "tls-"), strings.HasPrefix(id, "options-"):
+	case id == "etag-inode", strings.HasPrefix(id, "header-"), strings.HasPrefix(id, "cookie-"), strings.HasPrefix(id, "tls-"), strings.HasPrefix(id, "options-"):
 		return 4
 	default:
 		return 3
@@ -175,7 +178,6 @@ var fileSeverity = map[string]int{
 	"phpinfo-php":         2,
 	"php-credits":         2,
 	"dir-php-error":       2,
-	"etag-inode":          2,
 	"cloudflare-trace":    3,
 	"server-status":       3,
 	"actuator":            3,
@@ -186,7 +188,6 @@ var fileSeverity = map[string]int{
 	"python-samples":      4,
 	"robots-disallow":     4,
 	"sitemap-xml":         3,
-	"admin-login":         5,
 	"cpanel":              5,
 	"securecontrolpanel":  5,
 	"webmail":             5,
@@ -236,14 +237,83 @@ func severityOfFinding(f Finding) int {
 	return severityOf(f.ID)
 }
 
+// panelOrder lists the control panels before webmail. The interesting
+// directory rows follow them by severity.
+func panelOrder(id string) (int, bool) {
+	switch id {
+	case "cpanel":
+		return 0, true
+	case "securecontrolpanel":
+		return 1, true
+	case "webmail":
+		return 2, true
+	default:
+		return 0, false
+	}
+}
+
+// lateOrder is the order of the closing rows. The inode leak sits
+// immediately before the allowed-methods row.
+func lateOrder(id string) int {
+	switch {
+	case strings.HasPrefix(id, "cookie-"):
+		return 0
+	case strings.HasPrefix(id, "header-"):
+		return 1
+	case id == "etag-inode":
+		return 2
+	case strings.HasPrefix(id, "options-"):
+		return 3
+	default:
+		return 4
+	}
+}
+
+// acaoLess lists the wildcard CORS row immediately after the Cloudflare
+// trace. That header is read from the trace response.
+func acaoLess(a, b Finding) bool {
+	if a.ID == "header-acao" && b.ID == "header-acao" {
+		return a.URL < b.URL
+	}
+	if a.ID == "cloudflare-trace" && b.ID == "header-acao" {
+		return true
+	}
+	if a.ID == "header-acao" && b.ID == "cloudflare-trace" {
+		return false
+	}
+	twin := a
+	if b.ID == "header-acao" {
+		twin = b
+	}
+	twin.ID = "cloudflare-trace"
+	twin.Message = "Cloudflare trace output"
+	if a.ID == "header-acao" {
+		return findingLess(twin, b)
+	}
+	return findingLess(a, twin)
+}
+
 func findingLess(a, b Finding) bool {
+	if a.ID == "header-acao" || b.ID == "header-acao" {
+		return acaoLess(a, b)
+	}
 	ra, rb := findingRank(a.ID), findingRank(b.ID)
 	if ra != rb {
 		return ra < rb
 	}
+	if ra == 4 {
+		if oa, ob := lateOrder(a.ID), lateOrder(b.ID); oa != ob {
+			return oa < ob
+		}
+	}
 	if ra == 3 {
 		if sa, sb := severityOfFinding(a), severityOfFinding(b); sa != sb {
 			return sa < sb
+		}
+		if oa, oka := panelOrder(a.ID); oka {
+			if ob, okb := panelOrder(b.ID); okb && oa != ob {
+				return oa < ob
+			}
 		}
 	}
 	if strings.HasPrefix(a.ID, "cookie-") && strings.HasPrefix(b.ID, "cookie-") {

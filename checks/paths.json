@@ -254,7 +254,7 @@
     "method": "GET",
     "statuses": [200],
     "body": "(?i)<title>cPanel Redirect</title>",
-    "message": "Web-based control panel"
+    "message": "Web based control panel"
   },
   {
     "id": "info-dir",
