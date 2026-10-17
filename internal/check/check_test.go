@@ -483,8 +483,8 @@ func TestCloudflareTrace(t *testing.T) {
 	if trace.Message != "Cloudflare trace output" || !strings.HasSuffix(trace.URL, "/cdn-cgi/trace") {
 		t.Fatalf("trace %+v", trace)
 	}
-	if acao.Message != "Access-Control-Allow-Origin is *" || !strings.HasSuffix(acao.URL, "/cdn-cgi/trace") {
-		t.Fatalf("acao %+v", acao)
+	if acao.ID != "" {
+		t.Fatalf("trace CORS is not a second finding: %+v", acao)
 	}
 	if xfo.Message != "X-Frame-Options is set; Content-Security-Policy frame-ancestors replaced it" || !strings.HasSuffix(xfo.URL, "/cdn-cgi/trace") {
 		t.Fatalf("xfo %+v", xfo)
@@ -765,12 +765,34 @@ func TestFindingOrder(t *testing.T) {
 	}
 }
 
-func TestACAOAfterCloudflareTrace(t *testing.T) {
+func TestDBDirBeforeCloudflareTrace(t *testing.T) {
 	findings := []Finding{
-		{ID: "header-acao", URL: "https://example.com/cdn-cgi/trace", Message: "Access-Control-Allow-Origin is *"},
+		{ID: "cloudflare-trace", URL: "http://example.com/cdn-cgi/trace", Message: "Cloudflare trace output"},
+		{ID: "users-dir", URL: "http://example.com/users/", Message: "This might be interesting"},
+		{ID: "info-dir", URL: "http://example.com/info/", Message: "This might be interesting"},
+		{ID: "header-csp", URL: "http://example.com/", Message: "Content-Security-Policy is missing"},
+		{ID: "db-dir", URL: "http://example.com/db/", Message: "This might be interesting"},
+		{ID: "phpinfo", URL: "http://example.com/info.php", Message: "phpinfo() output"},
+		{ID: "sitemap-xml", URL: "http://example.com/sitemap.xml", Message: "Sitemap"},
+	}
+	sortFindings(findings)
+	var ids []string
+	for _, f := range findings {
+		ids = append(ids, f.ID)
+	}
+	want := []string{"phpinfo", "db-dir", "users-dir", "cloudflare-trace", "sitemap-xml", "info-dir", "header-csp"}
+	if strings.Join(ids, ",") != strings.Join(want, ",") {
+		t.Fatalf("%v", ids)
+	}
+}
+
+func TestACAOAfterCookies(t *testing.T) {
+	findings := []Finding{
+		{ID: "header-acao", URL: "https://example.com/", Message: "Access-Control-Allow-Origin is *"},
 		{ID: "sitemap-xml", URL: "https://example.com/sitemap.xml", Message: "Sitemap"},
 		{ID: "robots-disallow", URL: "https://example.com/robots.txt", Message: "A robots.txt page is readable"},
-		{ID: "cookie-httponly", URL: "https://example.com/", Message: "The 'ahoy_visitor' cookie is missing an HttpOnly flag"},
+		{ID: "cookie-secure", URL: "https://example.com/", Message: "The 'session' cookie is missing a Secure flag"},
+		{ID: "cookie-httponly", URL: "https://example.com/", Message: "The 'session' cookie is missing an HttpOnly flag"},
 		{ID: "header-csp", URL: "https://example.com/", Message: "Content-Security-Policy is missing"},
 		{ID: "cloudflare-trace", URL: "https://example.com/cdn-cgi/trace", Message: "Cloudflare trace output"},
 		{ID: "phpinfo", URL: "https://example.com/info.php", Message: "phpinfo() output"},
@@ -780,7 +802,7 @@ func TestACAOAfterCloudflareTrace(t *testing.T) {
 	for _, f := range findings {
 		ids = append(ids, f.ID)
 	}
-	want := []string{"phpinfo", "cloudflare-trace", "header-acao", "sitemap-xml", "robots-disallow", "cookie-httponly", "header-csp"}
+	want := []string{"phpinfo", "cloudflare-trace", "sitemap-xml", "robots-disallow", "cookie-httponly", "cookie-secure", "header-acao", "header-csp"}
 	if strings.Join(ids, ",") != strings.Join(want, ",") {
 		t.Fatalf("%v", ids)
 	}

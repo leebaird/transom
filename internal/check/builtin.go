@@ -512,9 +512,9 @@ func acaoFindings(ctx context.Context, c *fetch.Client, t target.Target, baseRes
 	return nil
 }
 
-// cloudflareTraceFindings reports Cloudflare's /cdn-cgi/trace page. The trace
-// response can also carry wildcard CORS or X-Frame-Options that the base
-// response did not.
+// cloudflareTraceFindings reports Cloudflare's /cdn-cgi/trace page. Wildcard
+// CORS on that same response is the trace finding again. X-Frame-Options is
+// reported when the base response did not set it.
 func cloudflareTraceFindings(ctx context.Context, c *fetch.Client, t target.Target, baseResp fetch.Response) []Finding {
 	resp := c.Do(ctx, http.MethodGet, t.Join("/cdn-cgi/trace"))
 	if resp.Err != nil {
@@ -522,15 +522,18 @@ func cloudflareTraceFindings(ctx context.Context, c *fetch.Client, t target.Targ
 	}
 	base := t.BaseURL()
 	var out []Finding
-	if cloudflareTrace(resp.Body) {
+	traced := cloudflareTrace(resp.Body)
+	if traced {
 		out = append(out, Finding{
 			ID: "cloudflare-trace", Target: base, URL: resp.URL, Status: resp.Status,
 			Message: "Cloudflare trace output",
 		})
 	}
-	if _, ok := wildcardACAO(base, baseResp); !ok {
-		if finding, ok := wildcardACAO(base, resp); ok {
-			out = append(out, finding)
+	if !traced {
+		if _, ok := wildcardACAO(base, baseResp); !ok {
+			if finding, ok := wildcardACAO(base, resp); ok {
+				out = append(out, finding)
+			}
 		}
 	}
 	if strings.TrimSpace(baseResp.Header.Get("X-Frame-Options")) == "" {

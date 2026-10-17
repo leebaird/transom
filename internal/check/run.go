@@ -269,33 +269,44 @@ func lateOrder(id string) int {
 	}
 }
 
-// acaoLess lists the wildcard CORS row immediately after the Cloudflare
-// trace. That header is read from the trace response.
-func acaoLess(a, b Finding) bool {
-	if a.ID == "header-acao" && b.ID == "header-acao" {
+// dirBeforeTrace lists /db/ and /users/ immediately before the Cloudflare
+// trace. The directories take the trace's place in the severity order.
+func dirBeforeTrace(a, b Finding) bool {
+	order := func(id string) (int, bool) {
+		switch id {
+		case "db-dir":
+			return 0, true
+		case "users-dir":
+			return 1, true
+		case "cloudflare-trace":
+			return 2, true
+		default:
+			return 0, false
+		}
+	}
+	oa, oka := order(a.ID)
+	ob, okb := order(b.ID)
+	if oka && okb {
+		if oa != ob {
+			return oa < ob
+		}
 		return a.URL < b.URL
 	}
-	if a.ID == "cloudflare-trace" && b.ID == "header-acao" {
-		return true
-	}
-	if a.ID == "header-acao" && b.ID == "cloudflare-trace" {
-		return false
-	}
 	twin := a
-	if b.ID == "header-acao" {
+	if okb {
 		twin = b
 	}
 	twin.ID = "cloudflare-trace"
 	twin.Message = "Cloudflare trace output"
-	if a.ID == "header-acao" {
+	if oka {
 		return findingLess(twin, b)
 	}
 	return findingLess(a, twin)
 }
 
 func findingLess(a, b Finding) bool {
-	if a.ID == "header-acao" || b.ID == "header-acao" {
-		return acaoLess(a, b)
+	if a.ID == "db-dir" || a.ID == "users-dir" || b.ID == "db-dir" || b.ID == "users-dir" {
+		return dirBeforeTrace(a, b)
 	}
 	ra, rb := findingRank(a.ID), findingRank(b.ID)
 	if ra != rb {
