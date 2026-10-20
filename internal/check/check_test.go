@@ -893,6 +893,33 @@ func TestLoginPageAfterWebConfig(t *testing.T) {
 	}
 }
 
+func TestSamePageShowsOnce(t *testing.T) {
+	page := "https://example.com/+CSCOE+/message.html?mc=2"
+	findings := []Finding{
+		{ID: "user-dir", URL: page, Message: "Readable"},
+		{ID: "homepage-dir", URL: page, Message: "Readable"},
+		{ID: "home-dir", URL: page, Message: "Readable"},
+		{ID: "home-dir", URL: "https://example.com/home/", Message: "Readable"},
+		{ID: "cookie-httponly", URL: "https://example.com/", Message: "The 'webvpnlogin' cookie is missing an HttpOnly flag"},
+		{ID: "cookie-httponly", URL: "https://example.com/", Message: "The 'webvpn' cookie is missing an HttpOnly flag"},
+	}
+	sortFindings(findings)
+	findings = uniqueShows(findings)
+	var got []string
+	for _, f := range findings {
+		got = append(got, f.ID+" "+f.Message+" "+f.URL)
+	}
+	want := []string{
+		"home-dir Readable " + page,
+		"home-dir Readable https://example.com/home/",
+		"cookie-httponly The 'webvpn' cookie is missing an HttpOnly flag https://example.com/",
+		"cookie-httponly The 'webvpnlogin' cookie is missing an HttpOnly flag https://example.com/",
+	}
+	if strings.Join(got, "\n") != strings.Join(want, "\n") {
+		t.Fatalf("%v", got)
+	}
+}
+
 func sortFindings(findings []Finding) {
 	sort.Slice(findings, func(i, j int) bool {
 		return findingLess(findings[i], findings[j])

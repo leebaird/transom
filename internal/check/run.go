@@ -135,10 +135,32 @@ func Run(ctx context.Context, t target.Target, client *fetch.Client, checks []Ch
 	sort.Slice(findings, func(i, j int) bool {
 		return findingLess(findings[i], findings[j])
 	})
+	findings = uniqueShows(findings)
 	if err := ctx.Err(); err != nil {
 		return findings, err
 	}
 	return findings, nil
+}
+
+// uniqueShows keeps the first row when several checks land on one page and
+// say the same thing. A redirect to a catch-all page would otherwise repeat
+// that page once per path.
+func uniqueShows(findings []Finding) []Finding {
+	seen := make(map[string]struct{}, len(findings))
+	out := make([]Finding, 0, len(findings))
+	for _, f := range findings {
+		if f.URL == "" {
+			out = append(out, f)
+			continue
+		}
+		key := f.Message + "\x00" + f.URL
+		if _, ok := seen[key]; ok {
+			continue
+		}
+		seen[key] = struct{}{}
+		out = append(out, f)
+	}
+	return out
 }
 
 func findingRank(id string) int {
