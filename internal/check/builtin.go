@@ -732,7 +732,7 @@ type rawResponse struct {
 // probe is one request, and a single drop would hide it.
 func rawExchange(ctx context.Context, t target.Target, req rawRequest, timeout time.Duration) (rawResponse, error) {
 	var last error
-	for try := 0; try < 3; try++ {
+	for range 3 {
 		if err := ctx.Err(); err != nil {
 			return rawResponse{}, err
 		}

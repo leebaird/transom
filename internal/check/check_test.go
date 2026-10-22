@@ -1125,7 +1125,11 @@ func TestBaseRequestRetried(t *testing.T) {
 	var n atomic.Int32
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if n.Add(1) == 1 {
-			conn, _, err := w.(http.Hijacker).Hijack()
+			hj, ok := w.(http.Hijacker)
+			if !ok {
+				return
+			}
+			conn, _, err := hj.Hijack()
 			if err != nil {
 				return
 			}

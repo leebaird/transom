@@ -44,7 +44,7 @@ func (c *Client) do(ctx context.Context, method, path string, identity bool) (ou
 	}()
 	// A dropped connection is not a finding. One closed handshake would
 	// otherwise hide the check.
-	for try := 0; try < 3; try++ {
+	for range 3 {
 		out = c.exchange(ctx, method, path, identity)
 		if out.Err == nil || !retriable(out.Err) {
 			return out
