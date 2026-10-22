@@ -893,10 +893,33 @@ func TestLoginPageAfterWebConfig(t *testing.T) {
 	}
 }
 
+func TestAspNetVersionMessage(t *testing.T) {
+	versionHeader := make(http.Header)
+	versionHeader.Set("X-AspNet-Version", "4.0.30319")
+	version, ok := aspnetVersion("https://example.com/", fetch.Response{
+		Status: 404,
+		URL:    "https://example.com/index.aspx",
+		Header: versionHeader,
+	})
+	if !ok || version.Message != "X-AspNet-Version 4.0.30319" {
+		t.Fatalf("%+v", version)
+	}
+	mvcHeader := make(http.Header)
+	mvcHeader.Set("X-AspNetMvc-Version", "5.2")
+	mvc, ok := aspnetVersion("https://example.com/", fetch.Response{
+		Status: 200,
+		URL:    "https://example.com/",
+		Header: mvcHeader,
+	})
+	if !ok || mvc.Message != "X-AspNetMvc-Version 5.2" {
+		t.Fatalf("%+v", mvc)
+	}
+}
+
 func TestAspNetVersionAfterInternalIP(t *testing.T) {
 	findings := []Finding{
 		{ID: "iisstart", URL: "https://example.com/iisstart.htm", Message: "Default IIS page"},
-		{ID: "header-aspnet-version", URL: "https://example.com/index.aspx", Message: "X-AspNet-Version discloses 4.0.30319"},
+		{ID: "header-aspnet-version", URL: "https://example.com/index.aspx", Message: "X-AspNet-Version 4.0.30319"},
 		{ID: "header-csp", URL: "https://example.com/", Message: "Content-Security-Policy is missing"},
 		{ID: "internal-ip", URL: "https://example.com/aspnet_client", Message: "Location discloses internal address 10.0.0.14"},
 		{ID: "header-powered-by", URL: "https://example.com/", Message: "X-Powered-By discloses ASP.NET"},

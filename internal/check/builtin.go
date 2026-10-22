@@ -625,7 +625,7 @@ func aspnetVersion(base string, resp fetch.Response) (Finding, bool) {
 		if value := resp.Header.Get(name); value != "" {
 			return Finding{
 				ID: "header-aspnet-version", Target: base, URL: resp.URL, Status: resp.Status,
-				Message: name + " discloses " + value,
+				Message: name + " " + value,
 			}, true
 		}
 	}
