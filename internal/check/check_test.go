@@ -1039,6 +1039,58 @@ func TestInternalIP(t *testing.T) {
 	}
 }
 
+func TestInternalIPOnHTTPS(t *testing.T) {
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, "https://10.0.0.14/aspnet_client/", http.StatusMovedPermanently)
+	}))
+	defer srv.Close()
+	host, portText, err := net.SplitHostPort(srv.Listener.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	port, err := strconv.Atoi(portText)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tg := target.Target{Host: host, Port: port, Scheme: "https", Root: "/"}
+	findings := internalIPFindings(t.Context(), tg, 2*time.Second)
+	if len(findings) != 1 || findings[0].Message != "Location discloses internal address 10.0.0.14" {
+		t.Fatalf("%+v", findings)
+	}
+}
+
+func TestBaseRequestRetried(t *testing.T) {
+	var n atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if n.Add(1) == 1 {
+			conn, _, err := w.(http.Hijacker).Hijack()
+			if err != nil {
+				return
+			}
+			conn.Close()
+			return
+		}
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer srv.Close()
+	host, portText, err := net.SplitHostPort(srv.Listener.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	port, err := strconv.Atoi(portText)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tg := target.Target{Host: host, Port: port, Scheme: "http", Root: "/"}
+	findings, err := Run(t.Context(), tg, mustClient(t, tg), nil, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n.Load() < 2 {
+		t.Fatalf("requests %d, findings %+v", n.Load(), findings)
+	}
+}
+
 func TestInternalIPIgnoresBody(t *testing.T) {
 	ln, err := (&net.ListenConfig{}).Listen(t.Context(), "tcp", "127.0.0.1:0")
 	if err != nil {

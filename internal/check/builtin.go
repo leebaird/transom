@@ -7,6 +7,7 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"io"
 	"maps"
@@ -646,9 +647,6 @@ func defaultIISFindings(ctx context.Context, t target.Target, timeout time.Durat
 }
 
 func internalIPFindings(ctx context.Context, t target.Target, timeout time.Duration) []Finding {
-	if t.Scheme != "http" {
-		return nil
-	}
 	path := t.Join("/aspnet_client")
 	status, header, _, err := http10NoHost(ctx, t, path, timeout)
 	if err != nil || status < 300 || status > 399 || header == nil {
@@ -730,8 +728,35 @@ type rawResponse struct {
 }
 
 // rawExchange dials t, completes TLS for an https target, sends req, and
-// reads one response.
+// reads one response. A closed handshake is tried again. The internal-address
+// probe is one request, and a single drop would hide it.
 func rawExchange(ctx context.Context, t target.Target, req rawRequest, timeout time.Duration) (rawResponse, error) {
+	var last error
+	for try := 0; try < 3; try++ {
+		if err := ctx.Err(); err != nil {
+			return rawResponse{}, err
+		}
+		resp, err := rawExchangeOnce(ctx, t, req, timeout)
+		if err == nil || !exchangeRetriable(err) {
+			return resp, err
+		}
+		last = err
+	}
+	return rawResponse{}, last
+}
+
+func exchangeRetriable(err error) bool {
+	if err == nil || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return false
+	}
+	var netErr net.Error
+	if errors.As(err, &netErr) && netErr.Timeout() {
+		return false
+	}
+	return true
+}
+
+func rawExchangeOnce(ctx context.Context, t target.Target, req rawRequest, timeout time.Duration) (rawResponse, error) {
 	uri, err := t.RequestURI(req.path)
 	if err != nil {
 		return rawResponse{}, err

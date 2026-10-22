@@ -3,7 +3,9 @@ package fetch
 import (
 	"context"
 	"crypto/tls"
+	"errors"
 	"io"
+	"net"
 	"net/http"
 	"time"
 
@@ -40,6 +42,29 @@ func (c *Client) do(ctx context.Context, method, path string, identity bool) (ou
 			c.Observe(out)
 		}
 	}()
+	// A dropped connection is not a finding. One closed handshake would
+	// otherwise hide the check.
+	for try := 0; try < 3; try++ {
+		out = c.exchange(ctx, method, path, identity)
+		if out.Err == nil || !retriable(out.Err) {
+			return out
+		}
+	}
+	return out
+}
+
+func retriable(err error) bool {
+	if err == nil || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return false
+	}
+	var netErr net.Error
+	if errors.As(err, &netErr) && netErr.Timeout() {
+		return false
+	}
+	return true
+}
+
+func (c *Client) exchange(ctx context.Context, method, path string, identity bool) (out Response) {
 	start := time.Now()
 	if method == "" {
 		method = http.MethodGet
