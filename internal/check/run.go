@@ -135,11 +135,30 @@ func Run(ctx context.Context, t target.Target, client *fetch.Client, checks []Ch
 	sort.Slice(findings, func(i, j int) bool {
 		return findingLess(findings[i], findings[j])
 	})
+	findings = preferIISStart(findings)
 	findings = uniqueShows(findings)
 	if err := ctx.Err(); err != nil {
 		return findings, err
 	}
 	return findings, nil
+}
+
+// preferIISStart drops the base default-page row when /iisstart.htm is
+// already reported. That file is the page IIS serves for /.
+func preferIISStart(findings []Finding) []Finding {
+	hasStart := false
+	for _, f := range findings {
+		if f.ID == "iisstart" {
+			hasStart = true
+			break
+		}
+	}
+	if !hasStart {
+		return findings
+	}
+	return slices.DeleteFunc(findings, func(f Finding) bool {
+		return f.ID == "iis-default" && f.Message == "Default IIS page"
+	})
 }
 
 // uniqueShows keeps the first row when several checks land on one page and
@@ -291,6 +310,31 @@ func lateOrder(id string) int {
 	}
 }
 
+// aspnetAfterInternalIP lists the ASP.NET version immediately after the
+// internal address. The version row takes that address's place, then
+// follows the address itself.
+func aspnetAfterInternalIP(a, b Finding) bool {
+	if a.ID == "header-aspnet-version" && b.ID == "header-aspnet-version" {
+		return a.URL < b.URL
+	}
+	if a.ID == "internal-ip" && b.ID == "header-aspnet-version" {
+		return true
+	}
+	if a.ID == "header-aspnet-version" && b.ID == "internal-ip" {
+		return false
+	}
+	twin := a
+	if b.ID == "header-aspnet-version" {
+		twin = b
+	}
+	twin.ID = "internal-ip"
+	twin.Message = "Location discloses internal address"
+	if a.ID == "header-aspnet-version" {
+		return findingLess(twin, b)
+	}
+	return findingLess(a, twin)
+}
+
 // dirBeforeTrace lists /db/ and /users/ immediately before the Cloudflare
 // trace. The directories take the trace's place in the severity order.
 func dirBeforeTrace(a, b Finding) bool {
@@ -329,6 +373,9 @@ func dirBeforeTrace(a, b Finding) bool {
 func findingLess(a, b Finding) bool {
 	if a.ID == "db-dir" || a.ID == "users-dir" || b.ID == "db-dir" || b.ID == "users-dir" {
 		return dirBeforeTrace(a, b)
+	}
+	if a.ID == "header-aspnet-version" || b.ID == "header-aspnet-version" {
+		return aspnetAfterInternalIP(a, b)
 	}
 	ra, rb := findingRank(a.ID), findingRank(b.ID)
 	if ra != rb {

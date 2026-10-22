@@ -893,6 +893,45 @@ func TestLoginPageAfterWebConfig(t *testing.T) {
 	}
 }
 
+func TestAspNetVersionAfterInternalIP(t *testing.T) {
+	findings := []Finding{
+		{ID: "iisstart", URL: "https://example.com/iisstart.htm", Message: "Default IIS page"},
+		{ID: "header-aspnet-version", URL: "https://example.com/index.aspx", Message: "X-AspNet-Version discloses 4.0.30319"},
+		{ID: "header-csp", URL: "https://example.com/", Message: "Content-Security-Policy is missing"},
+		{ID: "internal-ip", URL: "https://example.com/aspnet_client", Message: "Location discloses internal address 10.0.0.14"},
+		{ID: "header-powered-by", URL: "https://example.com/", Message: "X-Powered-By discloses ASP.NET"},
+	}
+	sortFindings(findings)
+	var ids []string
+	for _, f := range findings {
+		ids = append(ids, f.ID)
+	}
+	want := []string{"internal-ip", "header-aspnet-version", "iisstart", "header-csp", "header-powered-by"}
+	if strings.Join(ids, ",") != strings.Join(want, ",") {
+		t.Fatalf("%v", ids)
+	}
+}
+
+func TestIISStartReplacesBaseDefault(t *testing.T) {
+	findings := []Finding{
+		{ID: "iis-default", URL: "https://example.com/", Message: "Default IIS page"},
+		{ID: "iisstart", URL: "https://example.com/iisstart.htm", Message: "Default IIS page"},
+		{ID: "header-csp", URL: "https://example.com/", Message: "Content-Security-Policy is missing"},
+	}
+	findings = preferIISStart(findings)
+	var ids []string
+	for _, f := range findings {
+		ids = append(ids, f.ID)
+	}
+	if strings.Join(ids, ",") != "iisstart,header-csp" {
+		t.Fatalf("%v", ids)
+	}
+	only := preferIISStart([]Finding{{ID: "iis-default", URL: "https://example.com/", Message: "Default IIS page"}})
+	if len(only) != 1 || only[0].ID != "iis-default" {
+		t.Fatalf("%+v", only)
+	}
+}
+
 func TestSamePageShowsOnce(t *testing.T) {
 	page := "https://example.com/+CSCOE+/message.html?mc=2"
 	findings := []Finding{
