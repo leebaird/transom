@@ -1045,6 +1045,25 @@ func TestNginxAfterControlPanels(t *testing.T) {
 	}
 }
 
+func TestBannerChangeAfterSecureFlag(t *testing.T) {
+	findings := []Finding{
+		{ID: "banner-change", Message: "Server banner changed from 'Microsoft-IIS/10.0' to 'Microsoft-Azure-Application-Gateway/v2'"},
+		{ID: "header-csp", Message: "Content-Security-Policy is missing"},
+		{ID: "cookie-secure", Message: "The 'ApplicationGatewayAffinity' cookie is missing a Secure flag"},
+		{ID: "cookie-httponly", Message: "The 'ApplicationGatewayAffinity' cookie is missing an HttpOnly flag"},
+		{ID: "header-aspnet-version", Message: "X-AspNet-Version 4.0.30319"},
+	}
+	sortFindings(findings)
+	var ids []string
+	for _, f := range findings {
+		ids = append(ids, f.ID)
+	}
+	want := []string{"header-aspnet-version", "cookie-httponly", "cookie-secure", "banner-change", "header-csp"}
+	if strings.Join(ids, ",") != strings.Join(want, ",") {
+		t.Fatalf("%v", ids)
+	}
+}
+
 func TestCookieNameOrder(t *testing.T) {
 	findings := []Finding{
 		{ID: "cookie-secure", Message: "The 'security' cookie is missing a Secure flag"},
