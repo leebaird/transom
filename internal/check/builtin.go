@@ -896,25 +896,19 @@ func robotsFindings(ctx context.Context, c *fetch.Client, t target.Target, resp 
 		paths = paths[:robotsCap]
 	}
 	base := t.BaseURL()
-	var out []Finding
-	if len(paths) > 0 {
-		out = append(out, Finding{
-			ID: "robots-disallow", Target: base, URL: resp.URL, Status: resp.Status,
-			Message: "A robots.txt page is readable",
-		})
-	}
-	// Fetched together, reported in robots.txt order. A path that is not
-	// readable leaves its slot empty.
+	// Fetched together, reported in robots.txt order. robots.txt itself is
+	// not a Disallow path. A missing path leaves its slot empty. 401 and 403
+	// still name a directory the server has.
 	pages := make([]Finding, len(paths))
 	parallel.Each(len(paths), concurrency, func(i int) {
 		if ctx.Err() != nil {
 			return
 		}
 		page := c.Do(ctx, http.MethodGet, t.Join(paths[i]))
-		if page.Err != nil || page.Status != http.StatusOK {
+		if page.Err != nil || !robotsPathKept(page.Status) {
 			return
 		}
-		if softOK && fingerprint(page.Body) == soft {
+		if page.Status == http.StatusOK && softOK && fingerprint(page.Body) == soft {
 			return
 		}
 		pages[i] = Finding{
@@ -922,7 +916,17 @@ func robotsFindings(ctx context.Context, c *fetch.Client, t target.Target, resp 
 			Message: "A robots.txt page is readable",
 		}
 	})
-	return append(out, withoutEmpty(pages)...)
+	return withoutEmpty(pages)
+}
+
+// robotsPathKept reports a Disallow path the server has. A 404 does not.
+func robotsPathKept(status int) bool {
+	switch status {
+	case http.StatusOK, http.StatusUnauthorized, http.StatusForbidden:
+		return true
+	default:
+		return false
+	}
 }
 
 func disallowPaths(body string) []string {

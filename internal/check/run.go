@@ -195,7 +195,7 @@ func findingRank(id string) int {
 		return 1
 	case id == "internal-ip":
 		return 2
-	case id == "banner-change", id == "etag-inode", strings.HasPrefix(id, "header-"), strings.HasPrefix(id, "cookie-"), strings.HasPrefix(id, "tls-"), strings.HasPrefix(id, "options-"):
+	case id == "banner-change", strings.HasPrefix(id, "header-"), strings.HasPrefix(id, "cookie-"), strings.HasPrefix(id, "tls-"), strings.HasPrefix(id, "options-"):
 		return 4
 	default:
 		return 3
@@ -245,8 +245,9 @@ var fileSeverity = map[string]int{
 	"public-dir":          6,
 	"users-dir":           6,
 	"outdated-nginx":      7,
-	"trace-enabled":       8,
 	"multiviews":          8,
+	"etag-inode":          8,
+	"trace-enabled":       8,
 }
 
 func cookieName(message string) string {
@@ -293,7 +294,7 @@ func panelOrder(id string) (int, bool) {
 }
 
 // lateOrder is the order of the closing rows. A banner change follows
-// the cookie rows, and the inode leak sits immediately before allowed methods.
+// the cookie rows.
 func lateOrder(id string) int {
 	switch {
 	case strings.HasPrefix(id, "cookie-"):
@@ -302,12 +303,25 @@ func lateOrder(id string) int {
 		return 1
 	case strings.HasPrefix(id, "header-"):
 		return 2
-	case id == "etag-inode":
-		return 3
 	case strings.HasPrefix(id, "options-"):
-		return 4
+		return 3
 	default:
-		return 5
+		return 4
+	}
+}
+
+// beforeTrace lists MultiViews, then an inode leak, then TRACE.
+// The inode row has its own link, so it stays with MultiViews.
+func beforeTrace(id string) (int, bool) {
+	switch id {
+	case "multiviews":
+		return 0, true
+	case "etag-inode":
+		return 1, true
+	case "trace-enabled":
+		return 2, true
+	default:
+		return 0, false
 	}
 }
 
@@ -390,6 +404,11 @@ func findingLess(a, b Finding) bool {
 	if ra == 3 {
 		if sa, sb := severityOfFinding(a), severityOfFinding(b); sa != sb {
 			return sa < sb
+		}
+		if oa, oka := beforeTrace(a.ID); oka {
+			if ob, okb := beforeTrace(b.ID); okb && oa != ob {
+				return oa < ob
+			}
 		}
 		if oa, oka := panelOrder(a.ID); oka {
 			if ob, okb := panelOrder(b.ID); okb && oa != ob {

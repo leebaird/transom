@@ -828,6 +828,24 @@ func TestControlPanelsBeforeInteresting(t *testing.T) {
 	}
 }
 
+func TestETagBeforeTrace(t *testing.T) {
+	findings := []Finding{
+		{ID: "trace-enabled", URL: "http://example.com/", Message: "TRACE is enabled"},
+		{ID: "etag-inode", URL: "http://example.com/robots.txt", Message: "ETag leaks an inode"},
+		{ID: "multiviews", URL: "http://example.com/index", Message: "mod_negotiation MultiViews is enabled and offers index.php"},
+		{ID: "header-csp", URL: "http://example.com/", Message: "Content-Security-Policy is missing"},
+	}
+	sortFindings(findings)
+	var ids []string
+	for _, f := range findings {
+		ids = append(ids, f.ID)
+	}
+	want := []string{"multiviews", "etag-inode", "trace-enabled", "header-csp"}
+	if strings.Join(ids, ",") != strings.Join(want, ",") {
+		t.Fatalf("%v", ids)
+	}
+}
+
 func TestETagBeforeAllowedMethods(t *testing.T) {
 	findings := []Finding{
 		{ID: "options-allow", URL: "http://example.com/", Message: "Allowed HTTP Methods: OPTIONS, HEAD, GET"},
@@ -842,7 +860,7 @@ func TestETagBeforeAllowedMethods(t *testing.T) {
 	for _, f := range findings {
 		ids = append(ids, f.ID)
 	}
-	want := []string{"phpinfo", "console", "cookie-httponly", "header-csp", "etag-inode", "options-allow"}
+	want := []string{"phpinfo", "console", "etag-inode", "cookie-httponly", "header-csp", "options-allow"}
 	if strings.Join(ids, ",") != strings.Join(want, ",") {
 		t.Fatalf("%v", ids)
 	}
@@ -1296,15 +1314,42 @@ func TestRobotsReadablePath(t *testing.T) {
 			urls = append(urls, f.URL)
 		}
 	}
-	if len(urls) != 2 {
+	if len(urls) != 1 || !strings.HasSuffix(urls[0], "/secret") {
 		t.Fatalf("%v", urls)
 	}
-	var sawFile, sawSecret bool
-	for _, u := range urls {
-		sawFile = sawFile || strings.HasSuffix(u, "/robots.txt")
-		sawSecret = sawSecret || strings.HasSuffix(u, "/secret")
+}
+
+func TestRobotsForbiddenPath(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("X-Content-Type-Options", "nosniff")
+		w.Header().Set("Content-Security-Policy", "default-src 'none'")
+		w.Header().Set("Referrer-Policy", "no-referrer")
+		switch r.URL.Path {
+		case "/robots.txt":
+			_, _ = w.Write([]byte("User-agent: *\nDisallow: /statics/\nDisallow: /panel/\nDisallow: /gone/\n"))
+		case "/statics/":
+			_, _ = w.Write([]byte("static files"))
+		case "/panel/":
+			w.WriteHeader(http.StatusForbidden)
+			_, _ = w.Write([]byte("forbidden"))
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer srv.Close()
+	tg := mustTarget(t, srv.URL)
+	client := mustClient(t, tg)
+	findings, err := Run(t.Context(), tg, client, nil, 1)
+	if err != nil {
+		t.Fatal(err)
 	}
-	if !sawFile || !sawSecret {
+	var urls []string
+	for _, f := range findings {
+		if f.ID == "robots-disallow" {
+			urls = append(urls, f.URL)
+		}
+	}
+	if len(urls) != 2 || !strings.HasSuffix(urls[0], "/panel/") || !strings.HasSuffix(urls[1], "/statics/") {
 		t.Fatalf("%v", urls)
 	}
 }
